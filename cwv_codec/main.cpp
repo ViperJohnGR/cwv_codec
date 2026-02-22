@@ -95,6 +95,8 @@ int main(int argc, char** argv)
 
             BitPack output = encodeStream(inStream, gainInfos, bits, gain, saveCompressed);
 
+            printf("Final audio bit width: %u\n", output.bit_width);
+
             std::string outputName = removeExtensionFromPath(argv[i]);
             outputName += ".cwv";
 

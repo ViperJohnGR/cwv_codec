@@ -28,6 +28,62 @@ float unpackGainDb(uint8_t code)
     return std::pow(10.0f, db / 20.0f);
 }
 
+uint8_t diff_u8_mod(uint32_t a, uint32_t b, uint8_t bitsPerSample)
+{
+    if (!(bitsPerSample >= 1 && bitsPerSample <= 8))
+        return 0;
+
+    const uint32_t mask = (1u << bitsPerSample) - 1u;  // e.g. bits=5 -> 0x1F
+    a &= mask;                                          // ensure in-range
+    b &= mask;
+
+    // Modular subtraction (wraps at 2^bitsPerSample)
+    return static_cast<uint8_t>((a - b) & mask);
+}
+
+uint8_t decode_u8_mod(uint32_t b, uint32_t diff, uint8_t bitsPerSample)
+{
+    if (!(bitsPerSample >= 1 && bitsPerSample <= 8))
+        return 0;
+
+    const uint32_t mask = (1u << bitsPerSample) - 1u; // e.g. bits=5 -> 0x1F
+    b &= mask;
+    diff &= mask;
+
+    // Modular addition (wraps at 2^bitsPerSample)
+    return static_cast<uint8_t>((b + diff) & mask);
+}
+
+constexpr std::uint8_t zigzag_encode_int8(std::int8_t value, std::uint8_t bits) {
+    if (bits == 0 || bits > 8) return 0;
+
+    const std::uint16_t mask = (bits == 8) ? 0xFFu : static_cast<std::uint16_t>((1u << bits) - 1u);
+    std::uint16_t u = static_cast<std::uint16_t>(static_cast<std::uint8_t>(value)) & mask;
+
+    const std::uint16_t signbit = static_cast<std::uint16_t>(1u << (bits - 1u));
+    if (u & signbit) u |= static_cast<std::uint16_t>(~mask); // sign-extend from `bits`
+
+    const std::int16_t s = static_cast<std::int16_t>(u);
+    const std::uint16_t zz = (static_cast<std::uint16_t>(s) << 1)
+        ^ static_cast<std::uint16_t>(-static_cast<std::int16_t>(s < 0));
+
+    return static_cast<std::uint8_t>(zz & mask);
+}
+
+constexpr std::int8_t zigzag_decode_int8(std::uint8_t zigzag, std::uint8_t bits) {
+    if (bits == 0 || bits > 8) return 0;
+
+    const std::uint16_t mask = (bits == 8) ? 0xFFu : static_cast<std::uint16_t>((1u << bits) - 1u);
+    const std::uint16_t zz = static_cast<std::uint16_t>(zigzag) & mask;
+
+    std::uint16_t raw = (zz >> 1) ^ static_cast<std::uint16_t>(-static_cast<std::int16_t>(zz & 1u));
+    raw &= mask;
+
+    const std::uint16_t signbit = static_cast<std::uint16_t>(1u << (bits - 1u));
+    if (raw & signbit) raw |= static_cast<std::uint16_t>(~mask); // sign-extend back to int8
+
+    return static_cast<std::int8_t>(static_cast<std::int16_t>(raw));
+}
 
 BitPack encodeStream(audioStream &audio, std::vector<gainInfo> &gainInfos, int bitsPerSample, float gainStep, bool saveCompressed)
 {
@@ -51,6 +107,8 @@ BitPack encodeStream(audioStream &audio, std::vector<gainInfo> &gainInfos, int b
             currentGain[i] = 1.0;
         else
             currentGain[i] = std::clamp(1.0f / fabs(audio.sampleData[i]), std::numeric_limits<float>::min(), maxGain);
+
+        audio.sampleData[i] *= currentGain[i];
 
         gainInfos[i].numInfos++;
         ends[i].push_back(0);
@@ -133,6 +191,18 @@ BitPack encodeStream(audioStream &audio, std::vector<gainInfo> &gainInfos, int b
     }
     printf("Writing output buffer... 100%%\n");
 
+    for (int ch = 0; ch < audio.channels; ++ch)
+    {
+        uint8_t prev = outputBuffer[ch]; // keep first absolute sample
+
+        for (int i = ch + audio.channels; i < totalSamples; i += audio.channels)
+        {
+            uint8_t cur = outputBuffer[i];                       // absolute (still)
+            outputBuffer[i] = zigzag_encode_int8((int8_t)diff_u8_mod(cur, prev, bitsPerSample), bitsPerSample); // store delta in-place
+            prev = cur;                                          // advance prev (absolute)
+        }
+    }
+
     for (uint8_t i = 0; i < audio.channels; i++)
     {
         auto endsPacked = packBits<uint32_t>(ends[i]);
@@ -167,6 +237,15 @@ int decodeStream(const std::vector<uint8_t> &input, std::vector<float> &outputBu
     printf("Reading input... 0%%\r");
  
     auto unpackedAudio = unpackBits<uint8_t>(audio, bitsPerSample, totalSamples);
+
+    for (int i = channels; i < unpackedAudio.size(); i++)
+    {
+        unpackedAudio[i] = (uint8_t)zigzag_decode_int8(unpackedAudio[i], bitsPerSample);
+    }
+
+    for (int ch = 0; ch < channels; ++ch)
+        for (int i = ch + channels; i < totalSamples; i += channels)
+            unpackedAudio[i] = decode_u8_mod(unpackedAudio[i - channels], unpackedAudio[i], bitsPerSample);
 
     printf("Reading input... 100%%\nDecoding... 0%%\r");
 
