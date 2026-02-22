@@ -150,3 +150,8 @@ std::vector<T> unpackBits(const std::vector<std::uint8_t>& bytes, std::uint8_t b
 
     return out;
 }
+
+inline size_t calculateBitPackedSize(size_t n, size_t bits)
+{
+    return (n * bits + 7U) / 8U;
+}

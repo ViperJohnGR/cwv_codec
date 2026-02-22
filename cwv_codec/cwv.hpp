@@ -28,7 +28,7 @@ struct gainInfo
     uint32_t numInfos;
     uint8_t endsBitSize;
     std::vector<uint8_t> ends;
-    std::vector<float> gains;
+    std::vector<uint8_t> gains;
 };
 
 
