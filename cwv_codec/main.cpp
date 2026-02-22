@@ -82,7 +82,7 @@ int main(int argc, char** argv)
             gain = (float)atof(argv[i]);
             expectgain = 0;
         }
-        else if (getExtensionFromPath(argv[i]) != "cwv") //TODO: add error handling for invalid input files (unsupported extension, corrupted files etc)
+        else if (getExtensionFromPath(argv[i]) != "cwv")
         {
             printf("Using gain %.9g\n", gain);
             printf("Reading input...\n");

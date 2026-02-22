@@ -22,7 +22,7 @@ BitPack encodeStream(audioStream &audio, std::vector<gainInfo> &gainInfos, int b
     std::vector<std::vector<uint32_t>> ends(audio.channels, {});
 
 	auto totalSamples = audio.totalPCMFrameCount * audio.channels;
-	float maxGain = 100.0;
+	float maxGain = 100.0f;
 	std::vector<float> currentGain(audio.channels);
 
     for (int i = 0; i < audio.channels; i++)

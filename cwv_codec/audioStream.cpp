@@ -22,11 +22,20 @@ audioStream::audioStream(const std::string& path)
         return;
     }
 
+    if (info.channels < 1 || info.channels > 255)
+    {
+        channels = 0;
+        sampleRate = 0;
+        totalPCMFrameCount = 0;
+        printf("Error. Invalid number of channels (%d).\n", info.channels);
+        return;
+    }
+
     sampleData.resize(info.frames * info.channels);
     sf_readf_float(file, &sampleData[0], info.frames);
     sf_close(file);
 
-    channels = static_cast<uint8_t>(info.channels); //TODO: throw error if channels > 255 || channels < 1
+    channels = static_cast<uint8_t>(info.channels);
     sampleRate = info.samplerate;
     totalPCMFrameCount = info.frames;
 }
