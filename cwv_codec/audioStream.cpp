@@ -14,7 +14,13 @@ audioStream::audioStream(const std::string& path)
     SF_INFO info{};
     SNDFILE* file = sf_open(path.c_str(), SFM_READ, &info);
     if (file == nullptr)
+    {
+        channels = 0;
+        sampleRate = 0;
+        totalPCMFrameCount = 0;
         printf("Cannot open '%s'. %s\n", path.c_str(), sf_strerror(NULL));
+        return;
+    }
 
     sampleData.resize(info.frames * info.channels);
     sf_readf_float(file, &sampleData[0], info.frames);

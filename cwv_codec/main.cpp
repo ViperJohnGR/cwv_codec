@@ -27,14 +27,17 @@ int writeEncodedStream(const BitPack& audio, uint8_t channels, int sampleRate, s
             return 1;
         }
 
-        
+        size_t finalGainsSize = 0;
         for (const auto &info : gainInfos)
         {
-            fwrite(&info.numInfos, sizeof(uint32_t), 1, fp);
-            fwrite(&info.endsBitSize, sizeof(uint8_t), 1, fp);
-            fwrite(&info.ends[0], sizeof(uint8_t), info.ends.size(), fp);
-            fwrite(&info.gains[0], sizeof(float), info.gains.size(), fp);
+            finalGainsSize += fwrite(&info.numInfos, sizeof(uint32_t), 1, fp) * sizeof(uint32_t);
+            finalGainsSize += fwrite(&info.endsBitSize, sizeof(uint8_t), 1, fp);
+            finalGainsSize += fwrite(&info.ends[0], sizeof(uint8_t), info.ends.size(), fp);
+            finalGainsSize += fwrite(&info.gains[0], sizeof(float), info.gains.size(), fp) * sizeof(float);
         }
+
+        printf("Audio size written to file: %s\n", printBytes(bytesWritten).c_str());
+        printf("Gains block size written to file: %s\n", printBytes(finalGainsSize).c_str());
 
         fclose(fp);
     }

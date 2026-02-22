@@ -8,6 +8,7 @@
 std::string getFilenameFromPath(const std::string& path);
 std::string getExtensionFromPath(const std::string& path);
 std::string removeExtensionFromPath(const std::string& path);
+std::string printBytes(std::uint64_t bytes);
 
 struct BitPack {
     std::vector<std::uint8_t> bytes; // packed bitstream (MSB-first per byte)
@@ -31,9 +32,8 @@ BitPack packBits(const std::vector<T>& input)
 
     // 1) Detect max
     std::uint32_t maxv = 0;
-    for (T v : input) {
-        maxv = (std::uint32_t(v) > maxv) ? std::uint32_t(v) : maxv;
-    }
+    for (T v : input)
+        if (std::uint32_t(v) > maxv) maxv = std::uint32_t(v);
 
     // 2) Compute needed bit width (at least 1)
     auto bw = std::bit_width(maxv);

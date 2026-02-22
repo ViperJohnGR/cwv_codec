@@ -10,9 +10,9 @@ cwv::cwv(audioStream stream, uint8_t targetBits)
 
 BitPack encodeStream(audioStream &audio, std::vector<gainInfo> &gainInfos, int bitsPerSample, float gainStep, bool saveCompressed)
 {
-    if (audio.totalPCMFrameCount < audio.channels)
+    if (audio.sampleData.size() != audio.totalPCMFrameCount * audio.channels)
     {
-        printf("Error! audio.totalPCMFrameCount(%lld) < audio.channels(%d)\n", audio.totalPCMFrameCount, audio.channels);
+        printf("Error! audio.sampleData.size() is %llu. audio.totalPCMFrameCount(%llu) audio.channels(%u)\n", audio.sampleData.size(), audio.totalPCMFrameCount, audio.channels);
         return {};
     }
 
@@ -48,7 +48,7 @@ BitPack encodeStream(audioStream &audio, std::vector<gainInfo> &gainInfos, int b
         int currentProgress = static_cast<int>((i / (float)totalSamples) * 100.0f);
         for (int channel = 0; channel < audio.channels; channel++)
         {
-            if (fabs(currentGain[channel]) > maxGain)
+            if (currentGain[channel] > maxGain)
                 currentGain[channel] = maxGain;
             if ((fabs(audio.sampleData[i + channel]) * currentGain[channel]) > 1.0)
             {
@@ -98,11 +98,13 @@ BitPack encodeStream(audioStream &audio, std::vector<gainInfo> &gainInfos, int b
 
     printf("Writing output buffer... 0%%\r");
 
-    std::vector<uint8_t> outputBuffer;
+    std::vector<uint8_t> outputBuffer(totalSamples);
+    auto pow2toBitsPerSample = pow(2.0, bitsPerSample - 1.0) - 0.5;
+
     for (int i = 0; i < totalSamples; i++)
     {
         int currentProgress = static_cast<int>((i / (float)totalSamples) * 100.0);
-        outputBuffer.push_back(static_cast<uint8_t>(round((audio.sampleData[i] + 1.0) * (pow(2.0, bitsPerSample - 1.0) - 0.5))));
+        outputBuffer[i] = static_cast<uint8_t>(round((audio.sampleData[i] + 1.0) * pow2toBitsPerSample));
         if (currentProgress != progress)
         {
             printf("Writing output buffer... %d%%\r", currentProgress);
@@ -111,12 +113,12 @@ BitPack encodeStream(audioStream &audio, std::vector<gainInfo> &gainInfos, int b
     }
     printf("Writing output buffer... 100%%\n");
 
-    for (auto i = 0; i < audio.channels; i++)
+    for (uint8_t i = 0; i < audio.channels; i++)
     {
         auto endsPacked = packBits<uint32_t>(ends[i]);
         gainInfos[i].ends = endsPacked.bytes;
         gainInfos[i].endsBitSize = endsPacked.bit_width;
-        printf("Packed ends size channel %d = %d\n", i, endsPacked.bit_width);
+        printf("Packed ends bit width on channel %u = %u\n", i, endsPacked.bit_width);
     }
 
     return packBits<uint8_t>(outputBuffer);
@@ -138,7 +140,6 @@ int decodeStream(const std::vector<uint8_t> &input, std::vector<float> &outputBu
     float gainStep = *(float*)(pInput + headerLength - sizeof(float));
     auto totalSamples = totalPCMFrameCount * channels;
 
-    std::vector<uint8_t> finalBuffer;
     //const auto* audio = (&input[0]) + headerLength;
     std::vector<uint8_t> audio = std::vector<std::uint8_t>(input.begin() + headerLength, input.end());
 
