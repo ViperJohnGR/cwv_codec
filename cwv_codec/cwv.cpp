@@ -5,12 +5,16 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 namespace {
 
 constexpr float kMaxGain = 100.0f;
+constexpr bool kEnableAdaptiveBlockQuantization = true;
+constexpr uint8_t kAdaptiveQuantRadius = 1; // explore nominalBits +/- 1
 
 uint8_t packGainDb(float gain)
 {
@@ -110,6 +114,95 @@ bool readLE(const std::vector<uint8_t>& in, size_t& offset, T& outV)
     return true;
 }
 
+uint8_t quantizeNormalizedSample(float s, uint8_t bitsPerSample)
+{
+    const float qScale = static_cast<float>(std::pow(2.0, bitsPerSample - 1.0) - 0.5);
+    const uint32_t qMax = (1u << bitsPerSample) - 1u;
+    s = std::clamp(s, -1.0f, 1.0f);
+    const int qi = static_cast<int>(std::lround((s + 1.0f) * qScale));
+    return static_cast<uint8_t>(std::clamp(qi, 0, static_cast<int>(qMax)));
+}
+
+float dequantizeNormalizedCode(uint8_t q, uint8_t bitsPerSample)
+{
+    const float denom = static_cast<float>((1u << bitsPerSample) - 1u);
+    return (static_cast<float>(q) * 2.0f / denom) - 1.0f;
+}
+
+uint32_t computeBestPredictorAndWidth(const std::vector<uint8_t>& q, uint32_t framesInBlock, uint8_t channels, uint8_t bitsPerSample, uint8_t& outPredictor, uint8_t& outPackWidth)
+{
+    const uint32_t samplesInBlock = framesInBlock * channels;
+    const uint32_t residualCount = (samplesInBlock > channels) ? (samplesInBlock - channels) : 0;
+
+    if (residualCount == 0)
+    {
+        outPredictor = 0;
+        outPackWidth = 1;
+        return 1u + channels + static_cast<uint32_t>(calculateBitPackedSize(channels, bitsPerSample));
+    }
+
+    const uint32_t mask = (1u << bitsPerSample) - 1u;
+
+    auto measurePredictor = [&](uint8_t predictor) -> uint8_t
+    {
+        uint32_t maxv = 0;
+        for (uint8_t ch = 0; ch < channels; ++ch)
+        {
+            uint8_t prev2 = q[ch];
+            uint8_t prev1 = q[ch];
+
+            for (uint32_t f = 1; f < framesInBlock; ++f)
+            {
+                const uint32_t idx = f * channels + ch;
+                const uint8_t cur = q[idx];
+                const uint8_t pred =
+                    (predictor == 0 || f == 1)
+                    ? prev1
+                    : static_cast<uint8_t>((2u * prev1 - prev2) & mask);
+
+                const uint8_t diff = diff_u8_mod(cur, pred, bitsPerSample);
+                const uint8_t zz = zigzag_encode_int8(static_cast<int8_t>(diff), bitsPerSample);
+                maxv = std::max<uint32_t>(maxv, zz);
+
+                prev2 = prev1;
+                prev1 = cur;
+            }
+        }
+
+        return static_cast<uint8_t>(std::max<uint32_t>(1, std::bit_width(maxv)));
+    };
+
+    const uint8_t width0 = measurePredictor(0);
+    const uint8_t width1 = measurePredictor(1);
+
+    outPredictor = (width1 < width0) ? 1u : 0u;
+    outPackWidth = (outPredictor == 0) ? width0 : width1;
+
+    return 1u
+        + channels
+        + static_cast<uint32_t>(calculateBitPackedSize(channels, bitsPerSample))
+        + static_cast<uint32_t>(calculateBitPackedSize(residualCount, outPackWidth));
+}
+
+struct BlockCandidate
+{
+    uint8_t quantBits = 0;
+    uint8_t predictor = 0;
+    uint8_t packWidth = 1;
+    uint32_t encodedBytes = 0;
+    double distortion = 0.0;
+};
+
+int openBinaryWrite(FILE** f, const char* path)
+{
+#if defined(_WIN32)
+    return fopen_s(f, path, "wb");
+#else
+    *f = std::fopen(path, "wb");
+    return (*f != nullptr) ? 0 : 1;
+#endif
+}
+
 } // namespace
 
 
@@ -142,47 +235,23 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
     }
 
     const uint32_t numberOfBlocks = static_cast<uint32_t>((totalFrames + blockSizeFrames - 1) / blockSizeFrames);
+    const bool useAdaptiveBlockQuantization = kEnableAdaptiveBlockQuantization;
+    const uint8_t minQuantBits = static_cast<uint8_t>(std::max<int>(1, bitsPerSample - static_cast<int>(kAdaptiveQuantRadius)));
+    const uint8_t maxQuantBits = static_cast<uint8_t>(std::min<int>(8, bitsPerSample + static_cast<int>(kAdaptiveQuantRadius)));
 
-    // Rough reserve: header + per-block headers + packed data
-    std::vector<uint8_t> out;
-    out.reserve(64 + numberOfBlocks * 8);
-
-    // Header
-    out.insert(out.end(), { 'C','W','V' });
-    appendLE(out, audio.channels);
-    appendLE(out, static_cast<uint32_t>(audio.sampleRate));
-    appendLE(out, static_cast<sf_count_t>(audio.totalPCMFrameCount));
-    appendLE(out, static_cast<uint32_t>(blockSizeFrames));
-    appendLE(out, static_cast<uint32_t>(numberOfBlocks));
-    appendLE(out, static_cast<uint8_t>(bitsPerSample));
-
-    // For debug: save normalized audio (float) as a raw file, like the old code.
-    FILE* cmprFile = nullptr;
-    if (saveCompressed)
-        fopen_s(&cmprFile, "compressed", "wb");
-
-    const float qScale = static_cast<float>(std::pow(2.0, bitsPerSample - 1.0) - 0.5);
-    const uint32_t qMax = (1u << bitsPerSample) - 1u;
-
-    printf("Encoding %u blocks...\n", numberOfBlocks);
-
-    // Reuse per-block scratch buffers to avoid per-block heap churn.
+    // Scratch buffers shared across analysis and emission.
     const uint8_t channels = audio.channels;
     std::vector<float> peak(channels, 0.0f);
     std::vector<float> gain(channels, 1.0f);
     std::vector<uint8_t> gainCode(channels, 0);
-
     std::vector<uint8_t> q;
     q.reserve(static_cast<size_t>(blockSizeFrames) * channels);
 
-    std::vector<uint8_t> seed(channels, 0);
-    std::vector<uint8_t> residual;
-    if (blockSizeFrames > 0)
-        residual.reserve(static_cast<size_t>(blockSizeFrames - 1u) * channels);
+    std::vector<std::vector<BlockCandidate>> blockCandidates(numberOfBlocks);
+    std::vector<BlockCandidate> selected(numberOfBlocks);
+    uint64_t targetPayloadBytes = 0;
 
-    std::vector<float> norm;
-    if (cmprFile != nullptr)
-        norm.reserve(static_cast<size_t>(blockSizeFrames) * channels);
+    printf("Analyzing %u blocks...\n", numberOfBlocks);
 
     for (uint32_t b = 0; b < numberOfBlocks; ++b)
     {
@@ -191,7 +260,6 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
         const uint32_t samplesInBlock = framesInBlock * channels;
         const uint64_t startSample = startFrame * channels;
 
-        // Per-channel peak for normalization (avoid modulo in the hot loop)
         std::fill(peak.begin(), peak.end(), 0.0f);
         for (uint32_t f = 0; f < framesInBlock; ++f)
         {
@@ -205,11 +273,214 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
             float g = 1.0f;
             if (peak[ch] > 1e-12f)
                 g = std::clamp(1.0f / peak[ch], std::numeric_limits<float>::min(), kMaxGain);
-            gain[ch] = g;
+
+            // Important: quantize the gain here too, so the encoder uses the exact same
+            // scale factor the decoder will reconstruct from gainCode.
             gainCode[ch] = packGainDb(g);
+            gain[ch] = unpackGainDb(gainCode[ch]);
         }
 
-        // Quantize + DPCM (per-channel) + zigzag inside the block.
+        blockCandidates[b].reserve(useAdaptiveBlockQuantization ? static_cast<size_t>(maxQuantBits - minQuantBits + 1u) : 1u);
+
+        for (uint8_t blockQuantBits = (useAdaptiveBlockQuantization ? minQuantBits : bitsPerSample);
+             blockQuantBits <= (useAdaptiveBlockQuantization ? maxQuantBits : bitsPerSample);
+             ++blockQuantBits)
+        {
+            q.resize(samplesInBlock);
+
+            double distortion = 0.0;
+            for (uint32_t f = 0; f < framesInBlock; ++f)
+            {
+                const uint64_t inBase = startSample + static_cast<uint64_t>(f) * channels;
+                const uint32_t outBase = f * channels;
+                for (uint8_t ch = 0; ch < channels; ++ch)
+                {
+                    const float normalized = std::clamp(audio.sampleData[inBase + ch] * gain[ch], -1.0f, 1.0f);
+                    const uint8_t code = quantizeNormalizedSample(normalized, blockQuantBits);
+                    q[outBase + ch] = code;
+
+                    const float reconstructed = dequantizeNormalizedCode(code, blockQuantBits) / gain[ch];
+                    const double err = static_cast<double>(reconstructed) - static_cast<double>(audio.sampleData[inBase + ch]);
+                    distortion += err * err;
+                }
+            }
+
+            BlockCandidate candidate{};
+            candidate.quantBits = blockQuantBits;
+            candidate.distortion = distortion;
+            candidate.encodedBytes = computeBestPredictorAndWidth(q, framesInBlock, channels, blockQuantBits, candidate.predictor, candidate.packWidth);
+            blockCandidates[b].push_back(candidate);
+
+            if (blockQuantBits == bitsPerSample)
+            {
+                selected[b] = candidate;
+                targetPayloadBytes += candidate.encodedBytes;
+            }
+
+            if (!useAdaptiveBlockQuantization)
+                break;
+        }
+    }
+
+    if (useAdaptiveBlockQuantization)
+    {
+        auto chooseWithLambda = [&](double lambda, std::vector<BlockCandidate>& outSelection) -> uint64_t
+        {
+            uint64_t totalBytes = 0;
+            outSelection.resize(numberOfBlocks);
+
+            for (uint32_t b = 0; b < numberOfBlocks; ++b)
+            {
+                const auto& candidates = blockCandidates[b];
+                const BlockCandidate* best = &candidates.front();
+                double bestCost = best->distortion + lambda * static_cast<double>(best->encodedBytes);
+
+                for (size_t i = 1; i < candidates.size(); ++i)
+                {
+                    const double cost = candidates[i].distortion + lambda * static_cast<double>(candidates[i].encodedBytes);
+                    if (cost < bestCost
+                        || (cost == bestCost && candidates[i].encodedBytes < best->encodedBytes)
+                        || (cost == bestCost && candidates[i].encodedBytes == best->encodedBytes && candidates[i].distortion < best->distortion))
+                    {
+                        best = &candidates[i];
+                        bestCost = cost;
+                    }
+                }
+
+                outSelection[b] = *best;
+                totalBytes += best->encodedBytes;
+            }
+
+            return totalBytes;
+        };
+
+        std::vector<BlockCandidate> bestSelection(numberOfBlocks);
+        uint64_t bestSelectionBytes = chooseWithLambda(0.0, bestSelection);
+
+        if (bestSelectionBytes > targetPayloadBytes)
+        {
+            double lo = 0.0;
+            double hi = 1.0;
+            std::vector<BlockCandidate> trial(numberOfBlocks);
+
+            while (chooseWithLambda(hi, trial) > targetPayloadBytes)
+                hi *= 2.0;
+
+            for (int iter = 0; iter < 56; ++iter)
+            {
+                const double mid = 0.5 * (lo + hi);
+                const uint64_t totalBytes = chooseWithLambda(mid, trial);
+                if (totalBytes > targetPayloadBytes)
+                    lo = mid;
+                else
+                    hi = mid;
+            }
+
+            bestSelectionBytes = chooseWithLambda(hi, bestSelection);
+        }
+
+        // Spend any leftover budget on the most beneficial upgrades.
+        while (bestSelectionBytes < targetPayloadBytes)
+        {
+            const uint64_t remainingBudget = targetPayloadBytes - bestSelectionBytes;
+            double bestBenefitPerByte = 0.0;
+            int bestBlock = -1;
+            BlockCandidate bestUpgrade{};
+
+            for (uint32_t b = 0; b < numberOfBlocks; ++b)
+            {
+                const BlockCandidate& current = bestSelection[b];
+                for (const BlockCandidate& candidate : blockCandidates[b])
+                {
+                    if (candidate.encodedBytes <= current.encodedBytes || candidate.distortion >= current.distortion)
+                        continue;
+
+                    const uint64_t extraBytes = static_cast<uint64_t>(candidate.encodedBytes - current.encodedBytes);
+                    if (extraBytes > remainingBudget)
+                        continue;
+
+                    const double benefitPerByte = (current.distortion - candidate.distortion) / static_cast<double>(extraBytes);
+                    if (benefitPerByte > bestBenefitPerByte)
+                    {
+                        bestBenefitPerByte = benefitPerByte;
+                        bestBlock = static_cast<int>(b);
+                        bestUpgrade = candidate;
+                    }
+                }
+            }
+
+            if (bestBlock < 0)
+                break;
+
+            bestSelectionBytes += static_cast<uint64_t>(bestUpgrade.encodedBytes - bestSelection[bestBlock].encodedBytes);
+            bestSelection[bestBlock] = bestUpgrade;
+        }
+
+        selected = std::move(bestSelection);
+
+        printf("Adaptive quantization target payload: %s, selected payload: %s\n",
+            printBytes(targetPayloadBytes).c_str(),
+            printBytes(bestSelectionBytes).c_str());
+    }
+
+    // Rough reserve: header + chosen payload
+    std::vector<uint8_t> out;
+    out.reserve(64 + static_cast<size_t>(targetPayloadBytes));
+
+    // Header
+    out.insert(out.end(), { 'C','W','V' });
+    appendLE(out, audio.channels);
+    appendLE(out, static_cast<uint32_t>(audio.sampleRate));
+    appendLE(out, static_cast<sf_count_t>(audio.totalPCMFrameCount));
+    appendLE(out, static_cast<uint32_t>(blockSizeFrames));
+    appendLE(out, static_cast<uint32_t>(numberOfBlocks));
+    appendLE(out, static_cast<uint8_t>(useAdaptiveBlockQuantization ? (bitsPerSample | 0x80u) : bitsPerSample));
+
+    // For debug: save normalized audio (float) as a raw file, like the old code.
+    FILE* cmprFile = nullptr;
+    if (saveCompressed)
+        openBinaryWrite(&cmprFile, "compressed");
+
+    std::vector<uint8_t> seed(channels, 0);
+    std::vector<uint8_t> residual;
+    if (blockSizeFrames > 0)
+        residual.reserve(static_cast<size_t>(blockSizeFrames - 1u) * channels);
+
+    std::vector<float> norm;
+    if (cmprFile != nullptr)
+        norm.reserve(static_cast<size_t>(blockSizeFrames) * channels);
+
+    printf("Encoding %u blocks...\n", numberOfBlocks);
+
+    for (uint32_t b = 0; b < numberOfBlocks; ++b)
+    {
+        const uint64_t startFrame = static_cast<uint64_t>(b) * blockSizeFrames;
+        const uint32_t framesInBlock = static_cast<uint32_t>(std::min<uint64_t>(blockSizeFrames, totalFrames - startFrame));
+        const uint32_t samplesInBlock = framesInBlock * channels;
+        const uint64_t startSample = startFrame * channels;
+        const uint8_t blockQuantBits = selected[b].quantBits;
+        const uint8_t predictor = selected[b].predictor;
+        const uint32_t seedCount = channels;
+        const uint32_t residualCount = (samplesInBlock > seedCount) ? (samplesInBlock - seedCount) : 0;
+        const uint32_t mask = (1u << blockQuantBits) - 1u;
+
+        std::fill(peak.begin(), peak.end(), 0.0f);
+        for (uint32_t f = 0; f < framesInBlock; ++f)
+        {
+            const uint64_t base = startSample + static_cast<uint64_t>(f) * channels;
+            for (uint8_t ch = 0; ch < channels; ++ch)
+                peak[ch] = std::max(peak[ch], std::fabs(audio.sampleData[base + ch]));
+        }
+
+        for (uint8_t ch = 0; ch < channels; ++ch)
+        {
+            float g = 1.0f;
+            if (peak[ch] > 1e-12f)
+                g = std::clamp(1.0f / peak[ch], std::numeric_limits<float>::min(), kMaxGain);
+            gainCode[ch] = packGainDb(g);
+            gain[ch] = unpackGainDb(gainCode[ch]);
+        }
+
         q.resize(samplesInBlock);
         for (uint32_t f = 0; f < framesInBlock; ++f)
         {
@@ -217,83 +488,17 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
             const uint32_t outBase = f * channels;
             for (uint8_t ch = 0; ch < channels; ++ch)
             {
-                float s = audio.sampleData[inBase + ch] * gain[ch];
-                s = std::clamp(s, -1.0f, 1.0f);
-                const int qi = static_cast<int>(std::lround((s + 1.0f) * qScale));
-                q[outBase + ch] = static_cast<uint8_t>(std::clamp(qi, 0, static_cast<int>(qMax)));
+                const float normalized = std::clamp(audio.sampleData[inBase + ch] * gain[ch], -1.0f, 1.0f);
+                q[outBase + ch] = quantizeNormalizedSample(normalized, blockQuantBits);
             }
         }
 
-        // Split into seed (first frame) and residual payload (rest of block)
-        const uint32_t seedCount = channels;
-        const uint32_t residualCount = (samplesInBlock > seedCount) ? (samplesInBlock - seedCount) : 0;
-
-        // Seed is the first frame (one sample per channel).
         std::copy_n(q.begin(), seedCount, seed.begin());
 
-        // Build a zigzag-coded residual payload using an adaptive predictor:
-        //   predictor 0: 1st-order (pred = previous sample)
-        //   predictor 1: 2nd-order (pred = 2*prev1 - prev2), using predictor 0 for the 2nd sample
-        uint8_t predictor = 0;
         uint8_t packWidth = 1;
-
         residual.resize(residualCount);
         if (residualCount > 0)
         {
-            const uint32_t mask = (1u << bitsPerSample) - 1u;
-
-            auto signExtendMod = [](uint8_t v, uint8_t bits) -> int16_t
-            {
-                const uint16_t mask16 = (bits == 8) ? 0xFFu : static_cast<uint16_t>((1u << bits) - 1u);
-                v = static_cast<uint8_t>(v & mask16);
-                const uint16_t signbit = static_cast<uint16_t>(1u << (bits - 1u));
-                int16_t s = static_cast<int16_t>(v);
-                if (v & signbit)
-                    s = static_cast<int16_t>(s - static_cast<int16_t>(1u << bits));
-                return s;
-            };
-
-            auto abs16 = [](int16_t x) -> uint16_t { return static_cast<uint16_t>(x < 0 ? -x : x); };
-
-            // Measure both predictors without allocating 2 residual buffers.
-            uint32_t maxv1 = 0, maxv2 = 0;
-            uint64_t sumAbs1 = 0, sumAbs2 = 0;
-
-            for (uint8_t ch = 0; ch < channels; ++ch)
-            {
-                uint8_t prev2 = q[ch];
-                uint8_t prev1 = q[ch];
-
-                for (uint32_t f = 1; f < framesInBlock; ++f)
-                {
-                    const uint32_t idx = f * channels + ch;
-                    const uint8_t cur = q[idx];
-
-                    // Predictor 0: prev1
-                    const uint8_t diff1 = diff_u8_mod(cur, prev1, bitsPerSample);
-                    const uint8_t zz1 = zigzag_encode_int8(static_cast<int8_t>(diff1), bitsPerSample);
-                    maxv1 = std::max<uint32_t>(maxv1, zz1);
-                    sumAbs1 += abs16(signExtendMod(diff1, bitsPerSample));
-
-                    // Predictor 1: 2*prev1 - prev2 (but fall back to prev1 for the 2nd sample)
-                    const uint8_t pred2 = (f == 1) ? prev1 : static_cast<uint8_t>((2u * prev1 - prev2) & mask);
-                    const uint8_t diff2 = diff_u8_mod(cur, pred2, bitsPerSample);
-                    const uint8_t zz2 = zigzag_encode_int8(static_cast<int8_t>(diff2), bitsPerSample);
-                    maxv2 = std::max<uint32_t>(maxv2, zz2);
-                    sumAbs2 += abs16(signExtendMod(diff2, bitsPerSample));
-
-                    prev2 = prev1;
-                    prev1 = cur;
-                }
-            }
-
-            const uint8_t w1 = static_cast<uint8_t>(std::max<uint32_t>(1, std::bit_width(maxv1)));
-            const uint8_t w2 = static_cast<uint8_t>(std::max<uint32_t>(1, std::bit_width(maxv2)));
-
-            if (w2 < w1 || (w2 == w1 && sumAbs2 < sumAbs1))
-                predictor = 1;
-
-            // Build residual payload with the chosen predictor and compute the final pack width.
             uint32_t maxv = 0;
             for (uint8_t ch = 0; ch < channels; ++ch)
             {
@@ -304,16 +509,15 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
                 {
                     const uint32_t idx = f * channels + ch;
                     const uint8_t cur = q[idx];
-
                     const uint8_t pred =
-                        (predictor == 0 || f == 1) ? prev1 : static_cast<uint8_t>((2u * prev1 - prev2) & mask);
+                        (predictor == 0 || f == 1)
+                        ? prev1
+                        : static_cast<uint8_t>((2u * prev1 - prev2) & mask);
 
-                    const uint8_t diff = diff_u8_mod(cur, pred, bitsPerSample);
-                    const uint8_t zz = zigzag_encode_int8(static_cast<int8_t>(diff), bitsPerSample);
-
+                    const uint8_t diff = diff_u8_mod(cur, pred, blockQuantBits);
+                    const uint8_t zz = zigzag_encode_int8(static_cast<int8_t>(diff), blockQuantBits);
                     const uint32_t rIdx = (f - 1u) * channels + ch;
                     residual[rIdx] = zz;
-
                     maxv = std::max<uint32_t>(maxv, zz);
 
                     prev2 = prev1;
@@ -324,24 +528,31 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
             packWidth = static_cast<uint8_t>(std::max<uint32_t>(1, std::bit_width(maxv)));
         }
 
-        // Block header (packWidth in low nibble, predictor type in high nibble)
-        const uint8_t packInfo = static_cast<uint8_t>((predictor << 4) | (packWidth & 0x0F));
+        // Block header.
+        uint8_t packInfo = 0;
+        if (useAdaptiveBlockQuantization)
+        {
+            const uint8_t blockMode = static_cast<uint8_t>(((predictor & 0x01u) << 3) | ((blockQuantBits - 1u) & 0x07u));
+            packInfo = static_cast<uint8_t>((blockMode << 4) | (packWidth & 0x0Fu));
+        }
+        else
+        {
+            packInfo = static_cast<uint8_t>((predictor << 4) | (packWidth & 0x0F));
+        }
+
         out.push_back(packInfo);
         for (uint8_t ch = 0; ch < channels; ++ch)
             out.push_back(gainCode[ch]);
 
-        // Seed samples (packed with quant bits)
-        const BitPack seedPacked = packBitsFixed<uint8_t>(seed, bitsPerSample);
+        const BitPack seedPacked = packBitsFixed<uint8_t>(seed, blockQuantBits);
         out.insert(out.end(), seedPacked.bytes.begin(), seedPacked.bytes.end());
 
-        // Residual payload (packed with packWidth)
         if (residualCount > 0)
         {
             const BitPack residualPacked = packBitsFixed<uint8_t>(residual, packWidth);
             out.insert(out.end(), residualPacked.bytes.begin(), residualPacked.bytes.end());
         }
 
-        // Optional debug dump: write normalized float samples
         if (cmprFile != nullptr)
         {
             norm.resize(samplesInBlock);
@@ -392,7 +603,11 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
     if (!readLE(input, offset, hdr.totalPCMFrameCount)) return 1;
     if (!readLE(input, offset, hdr.blockSize)) return 1;
     if (!readLE(input, offset, hdr.numberOfBlocks)) return 1;
-    if (!readLE(input, offset, hdr.quantBits)) return 1;
+
+    uint8_t rawQuantBits = 0;
+    if (!readLE(input, offset, rawQuantBits)) return 1;
+    const bool adaptiveBlockQuantization = (rawQuantBits & 0x80u) != 0;
+    hdr.quantBits = static_cast<uint8_t>(rawQuantBits & 0x7Fu);
 
     if (hdr.channels < 1 || hdr.blockSize == 0 || hdr.numberOfBlocks == 0 || hdr.sampleRate == 0 || hdr.totalPCMFrameCount <= 0)
     {
@@ -410,7 +625,6 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
     const uint64_t totalSamples = totalFrames * hdr.channels;
     outputBuffer.assign(static_cast<size_t>(totalSamples), 0.0f);
 
-    // Reuse per-block scratch buffers to avoid per-block heap churn.
     const uint8_t channels = hdr.channels;
     std::vector<float> gain(channels, 1.0f);
     std::vector<uint8_t> seedPacked;
@@ -421,7 +635,7 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
     const uint64_t maxSamplesInBlock = static_cast<uint64_t>(hdr.blockSize) * channels;
     const uint64_t maxResidual = (maxSamplesInBlock > channels) ? (maxSamplesInBlock - channels) : 0;
     const uint32_t maxResidualU32 = static_cast<uint32_t>(std::min<uint64_t>(maxResidual, std::numeric_limits<uint32_t>::max()));
-    seedPacked.reserve(calculateBitPackedSize(channels, hdr.quantBits));
+    seedPacked.reserve(calculateBitPackedSize(channels, 8));
     payloadPacked.reserve(calculateBitPackedSize(maxResidualU32, 8));
     seed.reserve(channels);
     residual.reserve(maxResidualU32);
@@ -443,11 +657,20 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
             return 1;
         const uint8_t packInfo = input[offset++];
 
-        // CWV block header byte:
-        //   high nibble = predictor (0 or 1)
-        //   low  nibble = packWidth (1..8)
-        const uint8_t predictor = static_cast<uint8_t>(packInfo >> 4);
+        uint8_t predictor = 0;
+        uint8_t blockQuantBits = hdr.quantBits;
         const uint8_t packWidth = static_cast<uint8_t>(packInfo & 0x0F);
+
+        if (adaptiveBlockQuantization)
+        {
+            const uint8_t blockMode = static_cast<uint8_t>(packInfo >> 4);
+            predictor = static_cast<uint8_t>(blockMode >> 3);
+            blockQuantBits = static_cast<uint8_t>((blockMode & 0x07u) + 1u);
+        }
+        else
+        {
+            predictor = static_cast<uint8_t>(packInfo >> 4);
+        }
 
         if (packWidth < 1 || packWidth > 8)
         {
@@ -459,15 +682,18 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
             printf("Error! Invalid predictor type (%u).\n", predictor);
             return 1;
         }
+        if (blockQuantBits < 1 || blockQuantBits > 8)
+        {
+            printf("Error! Invalid block quantBits (%u).\n", blockQuantBits);
+            return 1;
+        }
 
-        // Gain codes per channel
         if (offset + channels > input.size())
             return 1;
         for (uint8_t ch = 0; ch < channels; ++ch)
             gain[ch] = unpackGainDb(input[offset++]);
 
-        // Seed samples: first frame packed with quantBits
-        const size_t seedBytes = calculateBitPackedSize(channels, hdr.quantBits);
+        const size_t seedBytes = calculateBitPackedSize(channels, blockQuantBits);
         if (offset + seedBytes > input.size())
         {
             printf("Error! Truncated CWV seed samples.\n");
@@ -476,7 +702,7 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
         seedPacked.assign(input.begin() + offset, input.begin() + offset + seedBytes);
         offset += seedBytes;
 
-        seed = unpackBits<uint8_t>(seedPacked, hdr.quantBits, channels);
+        seed = unpackBits<uint8_t>(seedPacked, blockQuantBits, channels);
 
         const uint32_t seedCount = channels;
         const uint32_t residualCount = (samplesInBlock > seedCount) ? (samplesInBlock - seedCount) : 0;
@@ -508,20 +734,18 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
             for (uint32_t i = 0; i < residualCount; ++i)
                 q[seedCount + i] = residual[i];
 
-            // Undo zigzag on residuals (encoded with quantBits)
             for (uint32_t i = seedCount; i < samplesInBlock; ++i)
-                q[i] = static_cast<uint8_t>(zigzag_decode_int8(q[i], hdr.quantBits));
+                q[i] = static_cast<uint8_t>(zigzag_decode_int8(q[i], blockQuantBits));
 
-            // Undo predictor (mod 2^quantBits)
             if (predictor == 0)
             {
                 for (uint8_t ch = 0; ch < channels; ++ch)
                     for (uint32_t i = ch + channels; i < samplesInBlock; i += channels)
-                        q[i] = decode_u8_mod(q[i - channels], q[i], hdr.quantBits);
+                        q[i] = decode_u8_mod(q[i - channels], q[i], blockQuantBits);
             }
-            else // predictor == 1
+            else
             {
-                const uint32_t mask = (1u << hdr.quantBits) - 1u;
+                const uint32_t mask = (1u << blockQuantBits) - 1u;
                 for (uint8_t ch = 0; ch < channels; ++ch)
                 {
                     for (uint32_t f = 1; f < framesInBlock; ++f)
@@ -533,21 +757,19 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
                             ? q[idx - channels]
                             : static_cast<uint8_t>((2u * q[idx - channels] - q[idx - 2u * channels]) & mask);
 
-                        q[idx] = decode_u8_mod(pred, diff, hdr.quantBits);
+                        q[idx] = decode_u8_mod(pred, diff, blockQuantBits);
                     }
                 }
             }
         }
 
-        // De-quantize and undo per-channel gain
-        const float denom = static_cast<float>((1u << hdr.quantBits) - 1u);
         for (uint32_t f = 0; f < framesInBlock; ++f)
         {
             const uint64_t outBase = startSample + static_cast<uint64_t>(f) * channels;
             const uint32_t inBase = f * channels;
             for (uint8_t ch = 0; ch < channels; ++ch)
             {
-                float s = (static_cast<float>(q[inBase + ch]) * 2.0f / denom) - 1.0f;
+                float s = dequantizeNormalizedCode(q[inBase + ch], blockQuantBits);
                 s /= gain[ch];
                 outputBuffer[static_cast<size_t>(outBase + ch)] = s;
             }
