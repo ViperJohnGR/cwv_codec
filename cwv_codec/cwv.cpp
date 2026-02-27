@@ -166,24 +166,41 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
 
     printf("Encoding %u blocks...\n", numberOfBlocks);
 
+    // Reuse per-block scratch buffers to avoid per-block heap churn.
+    const uint8_t channels = audio.channels;
+    std::vector<float> peak(channels, 0.0f);
+    std::vector<float> gain(channels, 1.0f);
+    std::vector<uint8_t> gainCode(channels, 0);
+
+    std::vector<uint8_t> q;
+    q.reserve(static_cast<size_t>(blockSizeFrames) * channels);
+
+    std::vector<uint8_t> seed(channels, 0);
+    std::vector<uint8_t> residual;
+    if (blockSizeFrames > 0)
+        residual.reserve(static_cast<size_t>(blockSizeFrames - 1u) * channels);
+
+    std::vector<float> norm;
+    if (cmprFile != nullptr)
+        norm.reserve(static_cast<size_t>(blockSizeFrames) * channels);
+
     for (uint32_t b = 0; b < numberOfBlocks; ++b)
     {
         const uint64_t startFrame = static_cast<uint64_t>(b) * blockSizeFrames;
         const uint32_t framesInBlock = static_cast<uint32_t>(std::min<uint64_t>(blockSizeFrames, totalFrames - startFrame));
-        const uint32_t samplesInBlock = framesInBlock * audio.channels;
-        const uint64_t startSample = startFrame * audio.channels;
+        const uint32_t samplesInBlock = framesInBlock * channels;
+        const uint64_t startSample = startFrame * channels;
 
-        // Per-channel peak for normalization
-        std::vector<float> peak(audio.channels, 0.0f);
-        for (uint32_t i = 0; i < samplesInBlock; ++i)
+        // Per-channel peak for normalization (avoid modulo in the hot loop)
+        std::fill(peak.begin(), peak.end(), 0.0f);
+        for (uint32_t f = 0; f < framesInBlock; ++f)
         {
-            const uint8_t ch = static_cast<uint8_t>(i % audio.channels);
-            peak[ch] = std::max(peak[ch], std::fabs(audio.sampleData[startSample + i]));
+            const uint64_t base = startSample + static_cast<uint64_t>(f) * channels;
+            for (uint8_t ch = 0; ch < channels; ++ch)
+                peak[ch] = std::max(peak[ch], std::fabs(audio.sampleData[base + ch]));
         }
 
-        std::vector<float> gain(audio.channels, 1.0f);
-        std::vector<uint8_t> gainCode(audio.channels, 0);
-        for (uint8_t ch = 0; ch < audio.channels; ++ch)
+        for (uint8_t ch = 0; ch < channels; ++ch)
         {
             float g = 1.0f;
             if (peak[ch] > 1e-12f)
@@ -193,20 +210,24 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
         }
 
         // Quantize + DPCM (per-channel) + zigzag inside the block.
-        std::vector<uint8_t> q(samplesInBlock);
-        for (uint32_t i = 0; i < samplesInBlock; ++i)
+        q.resize(samplesInBlock);
+        for (uint32_t f = 0; f < framesInBlock; ++f)
         {
-            const uint8_t ch = static_cast<uint8_t>(i % audio.channels);
-            float s = audio.sampleData[startSample + i] * gain[ch];
-            s = std::clamp(s, -1.0f, 1.0f);
-            const int qi = static_cast<int>(std::lround((s + 1.0f) * qScale));
-            q[i] = static_cast<uint8_t>(std::clamp(qi, 0, static_cast<int>(qMax)));
+            const uint64_t inBase = startSample + static_cast<uint64_t>(f) * channels;
+            const uint32_t outBase = f * channels;
+            for (uint8_t ch = 0; ch < channels; ++ch)
+            {
+                float s = audio.sampleData[inBase + ch] * gain[ch];
+                s = std::clamp(s, -1.0f, 1.0f);
+                const int qi = static_cast<int>(std::lround((s + 1.0f) * qScale));
+                q[outBase + ch] = static_cast<uint8_t>(std::clamp(qi, 0, static_cast<int>(qMax)));
+            }
         }
 
-        for (uint8_t ch = 0; ch < audio.channels; ++ch)
+        for (uint8_t ch = 0; ch < channels; ++ch)
         {
             uint8_t prev = q[ch];
-            for (uint32_t i = ch + audio.channels; i < samplesInBlock; i += audio.channels)
+            for (uint32_t i = ch + channels; i < samplesInBlock; i += channels)
             {
                 const uint8_t cur = q[i];
                 q[i] = zigzag_encode_int8(static_cast<int8_t>(diff_u8_mod(cur, prev, bitsPerSample)), bitsPerSample);
@@ -215,14 +236,14 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
         }
 
         // Split into seed (first frame) and residual payload (rest of block)
-        const uint32_t seedCount = audio.channels;
+        const uint32_t seedCount = channels;
         const uint32_t residualCount = (samplesInBlock > seedCount) ? (samplesInBlock - seedCount) : 0;
 
-        std::vector<uint8_t> seed(q.begin(), q.begin() + seedCount);
-        std::vector<uint8_t> residual;
-        residual.reserve(residualCount);
+        // Reuse seed/residual buffers.
+        std::copy_n(q.begin(), seedCount, seed.begin());
+        residual.resize(residualCount);
         if (residualCount > 0)
-            residual.assign(q.begin() + seedCount, q.end());
+            std::copy_n(q.begin() + seedCount, residualCount, residual.begin());
 
         // Pick the smallest packing bit width that fits this residual payload
         uint32_t maxv = 0;
@@ -232,7 +253,7 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
 
         // Block header
         out.push_back(packWidth);
-        for (uint8_t ch = 0; ch < audio.channels; ++ch)
+        for (uint8_t ch = 0; ch < channels; ++ch)
             out.push_back(gainCode[ch]);
 
         // Seed samples (packed with quant bits)
@@ -249,11 +270,13 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
         // Optional debug dump: write normalized float samples
         if (cmprFile != nullptr)
         {
-            std::vector<float> norm(samplesInBlock);
-            for (uint32_t i = 0; i < samplesInBlock; ++i)
+            norm.resize(samplesInBlock);
+            for (uint32_t f = 0; f < framesInBlock; ++f)
             {
-                const uint8_t ch = static_cast<uint8_t>(i % audio.channels);
-                norm[i] = std::clamp(audio.sampleData[startSample + i] * gain[ch], -1.0f, 1.0f);
+                const uint64_t inBase = startSample + static_cast<uint64_t>(f) * channels;
+                const uint32_t outBase = f * channels;
+                for (uint8_t ch = 0; ch < channels; ++ch)
+                    norm[outBase + ch] = std::clamp(audio.sampleData[inBase + ch] * gain[ch], -1.0f, 1.0f);
             }
             fwrite(norm.data(), sizeof(float), samplesInBlock, cmprFile);
         }
@@ -309,6 +332,23 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
     const uint64_t totalSamples = totalFrames * hdr.channels;
     outputBuffer.assign(static_cast<size_t>(totalSamples), 0.0f);
 
+    // Reuse per-block scratch buffers to avoid per-block heap churn.
+    const uint8_t channels = hdr.channels;
+    std::vector<float> gain(channels, 1.0f);
+    std::vector<uint8_t> seedPacked;
+    std::vector<uint8_t> payloadPacked;
+    std::vector<uint8_t> seed;
+    std::vector<uint8_t> residual;
+    std::vector<uint8_t> q;
+    const uint64_t maxSamplesInBlock = static_cast<uint64_t>(hdr.blockSize) * channels;
+    const uint64_t maxResidual = (maxSamplesInBlock > channels) ? (maxSamplesInBlock - channels) : 0;
+    const uint32_t maxResidualU32 = static_cast<uint32_t>(std::min<uint64_t>(maxResidual, std::numeric_limits<uint32_t>::max()));
+    seedPacked.reserve(calculateBitPackedSize(channels, hdr.quantBits));
+    payloadPacked.reserve(calculateBitPackedSize(maxResidualU32, 8));
+    seed.reserve(channels);
+    residual.reserve(maxResidualU32);
+    q.reserve(static_cast<size_t>(maxSamplesInBlock));
+
     for (uint32_t b = 0; b < hdr.numberOfBlocks; ++b)
     {
         const uint64_t startFrame = static_cast<uint64_t>(b) * hdr.blockSize;
@@ -318,8 +358,8 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
             return 1;
         }
         const uint32_t framesInBlock = static_cast<uint32_t>(std::min<uint64_t>(hdr.blockSize, totalFrames - startFrame));
-        const uint32_t samplesInBlock = framesInBlock * hdr.channels;
-        const uint64_t startSample = startFrame * hdr.channels;
+        const uint32_t samplesInBlock = framesInBlock * channels;
+        const uint64_t startSample = startFrame * channels;
 
         if (offset + 1 > input.size())
             return 1;
@@ -331,25 +371,24 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
         }
 
         // Gain codes per channel
-        if (offset + hdr.channels > input.size())
+        if (offset + channels > input.size())
             return 1;
-        std::vector<float> gain(hdr.channels, 1.0f);
-        for (uint8_t ch = 0; ch < hdr.channels; ++ch)
+        for (uint8_t ch = 0; ch < channels; ++ch)
             gain[ch] = unpackGainDb(input[offset++]);
 
         // Seed samples: first frame packed with quantBits
-        const size_t seedBytes = calculateBitPackedSize(hdr.channels, hdr.quantBits);
+        const size_t seedBytes = calculateBitPackedSize(channels, hdr.quantBits);
         if (offset + seedBytes > input.size())
         {
             printf("Error! Truncated CWV3 seed samples.\n");
             return 1;
         }
-        std::vector<uint8_t> seedPacked(input.begin() + offset, input.begin() + offset + seedBytes);
+        seedPacked.assign(input.begin() + offset, input.begin() + offset + seedBytes);
         offset += seedBytes;
 
-        std::vector<uint8_t> seed = unpackBits<uint8_t>(seedPacked, hdr.quantBits, hdr.channels);
+        seed = unpackBits<uint8_t>(seedPacked, hdr.quantBits, channels);
 
-        const uint32_t seedCount = hdr.channels;
+        const uint32_t seedCount = channels;
         const uint32_t residualCount = (samplesInBlock > seedCount) ? (samplesInBlock - seedCount) : 0;
 
         const size_t payloadBytes = calculateBitPackedSize(residualCount, packWidth);
@@ -359,20 +398,23 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
             return 1;
         }
 
-        std::vector<uint8_t> payloadPacked;
         if (payloadBytes > 0)
         {
             payloadPacked.assign(input.begin() + offset, input.begin() + offset + payloadBytes);
             offset += payloadBytes;
         }
+        else
+        {
+            payloadPacked.clear();
+        }
 
-        std::vector<uint8_t> q(samplesInBlock, 0);
-        for (uint8_t ch = 0; ch < hdr.channels; ++ch)
+        q.assign(samplesInBlock, 0);
+        for (uint8_t ch = 0; ch < channels; ++ch)
             q[ch] = seed[ch];
 
         if (residualCount > 0)
         {
-            std::vector<uint8_t> residual = unpackBits<uint8_t>(payloadPacked, packWidth, residualCount);
+            residual = unpackBits<uint8_t>(payloadPacked, packWidth, residualCount);
             for (uint32_t i = 0; i < residualCount; ++i)
                 q[seedCount + i] = residual[i];
 
@@ -381,19 +423,23 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
                 q[i] = static_cast<uint8_t>(zigzag_decode_int8(q[i], hdr.quantBits));
 
             // Undo DPCM (mod 2^quantBits)
-            for (uint8_t ch = 0; ch < hdr.channels; ++ch)
-                for (uint32_t i = ch + hdr.channels; i < samplesInBlock; i += hdr.channels)
-                    q[i] = decode_u8_mod(q[i - hdr.channels], q[i], hdr.quantBits);
+            for (uint8_t ch = 0; ch < channels; ++ch)
+                for (uint32_t i = ch + channels; i < samplesInBlock; i += channels)
+                    q[i] = decode_u8_mod(q[i - channels], q[i], hdr.quantBits);
         }
 
         // De-quantize and undo per-channel gain
         const float denom = static_cast<float>((1u << hdr.quantBits) - 1u);
-        for (uint32_t i = 0; i < samplesInBlock; ++i)
+        for (uint32_t f = 0; f < framesInBlock; ++f)
         {
-            const uint8_t ch = static_cast<uint8_t>(i % hdr.channels);
-            float s = (static_cast<float>(q[i]) * 2.0f / denom) - 1.0f;
-            s /= gain[ch];
-            outputBuffer[static_cast<size_t>(startSample + i)] = s;
+            const uint64_t outBase = startSample + static_cast<uint64_t>(f) * channels;
+            const uint32_t inBase = f * channels;
+            for (uint8_t ch = 0; ch < channels; ++ch)
+            {
+                float s = (static_cast<float>(q[inBase + ch]) * 2.0f / denom) - 1.0f;
+                s /= gain[ch];
+                outputBuffer[static_cast<size_t>(outBase + ch)] = s;
+            }
         }
     }
 
