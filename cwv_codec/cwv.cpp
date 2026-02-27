@@ -148,7 +148,7 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
     out.reserve(64 + numberOfBlocks * 8);
 
     // Header
-    out.insert(out.end(), { 'C','W','V','3' });
+    out.insert(out.end(), { 'C','W','V' });
     appendLE(out, audio.channels);
     appendLE(out, static_cast<uint32_t>(audio.sampleRate));
     appendLE(out, static_cast<sf_count_t>(audio.totalPCMFrameCount));
@@ -224,35 +224,109 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
             }
         }
 
-        for (uint8_t ch = 0; ch < channels; ++ch)
-        {
-            uint8_t prev = q[ch];
-            for (uint32_t i = ch + channels; i < samplesInBlock; i += channels)
-            {
-                const uint8_t cur = q[i];
-                q[i] = zigzag_encode_int8(static_cast<int8_t>(diff_u8_mod(cur, prev, bitsPerSample)), bitsPerSample);
-                prev = cur;
-            }
-        }
-
         // Split into seed (first frame) and residual payload (rest of block)
         const uint32_t seedCount = channels;
         const uint32_t residualCount = (samplesInBlock > seedCount) ? (samplesInBlock - seedCount) : 0;
 
-        // Reuse seed/residual buffers.
+        // Seed is the first frame (one sample per channel).
         std::copy_n(q.begin(), seedCount, seed.begin());
+
+        // Build a zigzag-coded residual payload using an adaptive predictor:
+        //   predictor 0: 1st-order (pred = previous sample)
+        //   predictor 1: 2nd-order (pred = 2*prev1 - prev2), using predictor 0 for the 2nd sample
+        uint8_t predictor = 0;
+        uint8_t packWidth = 1;
+
         residual.resize(residualCount);
         if (residualCount > 0)
-            std::copy_n(q.begin() + seedCount, residualCount, residual.begin());
+        {
+            const uint32_t mask = (1u << bitsPerSample) - 1u;
 
-        // Pick the smallest packing bit width that fits this residual payload
-        uint32_t maxv = 0;
-        for (uint8_t v : residual)
-            maxv = std::max<uint32_t>(maxv, v);
-        const uint8_t packWidth = static_cast<uint8_t>(std::max<uint32_t>(1, std::bit_width(maxv)));
+            auto signExtendMod = [](uint8_t v, uint8_t bits) -> int16_t
+            {
+                const uint16_t mask16 = (bits == 8) ? 0xFFu : static_cast<uint16_t>((1u << bits) - 1u);
+                v = static_cast<uint8_t>(v & mask16);
+                const uint16_t signbit = static_cast<uint16_t>(1u << (bits - 1u));
+                int16_t s = static_cast<int16_t>(v);
+                if (v & signbit)
+                    s = static_cast<int16_t>(s - static_cast<int16_t>(1u << bits));
+                return s;
+            };
 
-        // Block header
-        out.push_back(packWidth);
+            auto abs16 = [](int16_t x) -> uint16_t { return static_cast<uint16_t>(x < 0 ? -x : x); };
+
+            // Measure both predictors without allocating 2 residual buffers.
+            uint32_t maxv1 = 0, maxv2 = 0;
+            uint64_t sumAbs1 = 0, sumAbs2 = 0;
+
+            for (uint8_t ch = 0; ch < channels; ++ch)
+            {
+                uint8_t prev2 = q[ch];
+                uint8_t prev1 = q[ch];
+
+                for (uint32_t f = 1; f < framesInBlock; ++f)
+                {
+                    const uint32_t idx = f * channels + ch;
+                    const uint8_t cur = q[idx];
+
+                    // Predictor 0: prev1
+                    const uint8_t diff1 = diff_u8_mod(cur, prev1, bitsPerSample);
+                    const uint8_t zz1 = zigzag_encode_int8(static_cast<int8_t>(diff1), bitsPerSample);
+                    maxv1 = std::max<uint32_t>(maxv1, zz1);
+                    sumAbs1 += abs16(signExtendMod(diff1, bitsPerSample));
+
+                    // Predictor 1: 2*prev1 - prev2 (but fall back to prev1 for the 2nd sample)
+                    const uint8_t pred2 = (f == 1) ? prev1 : static_cast<uint8_t>((2u * prev1 - prev2) & mask);
+                    const uint8_t diff2 = diff_u8_mod(cur, pred2, bitsPerSample);
+                    const uint8_t zz2 = zigzag_encode_int8(static_cast<int8_t>(diff2), bitsPerSample);
+                    maxv2 = std::max<uint32_t>(maxv2, zz2);
+                    sumAbs2 += abs16(signExtendMod(diff2, bitsPerSample));
+
+                    prev2 = prev1;
+                    prev1 = cur;
+                }
+            }
+
+            const uint8_t w1 = static_cast<uint8_t>(std::max<uint32_t>(1, std::bit_width(maxv1)));
+            const uint8_t w2 = static_cast<uint8_t>(std::max<uint32_t>(1, std::bit_width(maxv2)));
+
+            if (w2 < w1 || (w2 == w1 && sumAbs2 < sumAbs1))
+                predictor = 1;
+
+            // Build residual payload with the chosen predictor and compute the final pack width.
+            uint32_t maxv = 0;
+            for (uint8_t ch = 0; ch < channels; ++ch)
+            {
+                uint8_t prev2 = q[ch];
+                uint8_t prev1 = q[ch];
+
+                for (uint32_t f = 1; f < framesInBlock; ++f)
+                {
+                    const uint32_t idx = f * channels + ch;
+                    const uint8_t cur = q[idx];
+
+                    const uint8_t pred =
+                        (predictor == 0 || f == 1) ? prev1 : static_cast<uint8_t>((2u * prev1 - prev2) & mask);
+
+                    const uint8_t diff = diff_u8_mod(cur, pred, bitsPerSample);
+                    const uint8_t zz = zigzag_encode_int8(static_cast<int8_t>(diff), bitsPerSample);
+
+                    const uint32_t rIdx = (f - 1u) * channels + ch;
+                    residual[rIdx] = zz;
+
+                    maxv = std::max<uint32_t>(maxv, zz);
+
+                    prev2 = prev1;
+                    prev1 = cur;
+                }
+            }
+
+            packWidth = static_cast<uint8_t>(std::max<uint32_t>(1, std::bit_width(maxv)));
+        }
+
+        // Block header (packWidth in low nibble, predictor type in high nibble)
+        const uint8_t packInfo = static_cast<uint8_t>((predictor << 4) | (packWidth & 0x0F));
+        out.push_back(packInfo);
         for (uint8_t ch = 0; ch < channels; ++ch)
             out.push_back(gainCode[ch]);
 
@@ -292,20 +366,24 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
 
 int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffer, CWVHeader* outHeader)
 {
-    if (input.size() < 4)
+    if (input.size() < 3)
         return 1;
 
     size_t offset = 0;
 
     CWVHeader hdr{};
-    if (offset + 4 > input.size())
+    if (offset + 3 > input.size())
         return 1;
-    std::memcpy(hdr.magic, input.data(), 4);
-    offset += 4;
+    // File magic is exactly 3 bytes: "CWV".
+    hdr.magic[0] = input[offset + 0];
+    hdr.magic[1] = input[offset + 1];
+    hdr.magic[2] = input[offset + 2];
+    offset += 3;
 
-    if (!(hdr.magic[0] == 'C' && hdr.magic[1] == 'W' && hdr.magic[2] == 'V' && hdr.magic[3] == '3'))
+    const bool isCWV = (hdr.magic[0] == 'C' && hdr.magic[1] == 'W' && hdr.magic[2] == 'V');
+    if (!isCWV)
     {
-        printf("Error! Not a CWV3 file (bad magic).\n");
+        printf("Error! Not a CWV file (bad magic).\\n");
         return 1;
     }
 
@@ -318,7 +396,7 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
 
     if (hdr.channels < 1 || hdr.blockSize == 0 || hdr.numberOfBlocks == 0 || hdr.sampleRate == 0 || hdr.totalPCMFrameCount <= 0)
     {
-        printf("Error! Invalid CWV3 header.\n");
+        printf("Error! Invalid CWV header.\n");
         return 1;
     }
 
@@ -363,10 +441,22 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
 
         if (offset + 1 > input.size())
             return 1;
-        const uint8_t packWidth = input[offset++];
+        const uint8_t packInfo = input[offset++];
+
+        // CWV block header byte:
+        //   high nibble = predictor (0 or 1)
+        //   low  nibble = packWidth (1..8)
+        const uint8_t predictor = static_cast<uint8_t>(packInfo >> 4);
+        const uint8_t packWidth = static_cast<uint8_t>(packInfo & 0x0F);
+
         if (packWidth < 1 || packWidth > 8)
         {
             printf("Error! Invalid block packWidth (%u).\n", packWidth);
+            return 1;
+        }
+        if (predictor > 1)
+        {
+            printf("Error! Invalid predictor type (%u).\n", predictor);
             return 1;
         }
 
@@ -380,7 +470,7 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
         const size_t seedBytes = calculateBitPackedSize(channels, hdr.quantBits);
         if (offset + seedBytes > input.size())
         {
-            printf("Error! Truncated CWV3 seed samples.\n");
+            printf("Error! Truncated CWV seed samples.\n");
             return 1;
         }
         seedPacked.assign(input.begin() + offset, input.begin() + offset + seedBytes);
@@ -394,7 +484,7 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
         const size_t payloadBytes = calculateBitPackedSize(residualCount, packWidth);
         if (offset + payloadBytes > input.size())
         {
-            printf("Error! Truncated CWV3 block payload.\n");
+            printf("Error! Truncated CWV block payload.\n");
             return 1;
         }
 
@@ -422,10 +512,31 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
             for (uint32_t i = seedCount; i < samplesInBlock; ++i)
                 q[i] = static_cast<uint8_t>(zigzag_decode_int8(q[i], hdr.quantBits));
 
-            // Undo DPCM (mod 2^quantBits)
-            for (uint8_t ch = 0; ch < channels; ++ch)
-                for (uint32_t i = ch + channels; i < samplesInBlock; i += channels)
-                    q[i] = decode_u8_mod(q[i - channels], q[i], hdr.quantBits);
+            // Undo predictor (mod 2^quantBits)
+            if (predictor == 0)
+            {
+                for (uint8_t ch = 0; ch < channels; ++ch)
+                    for (uint32_t i = ch + channels; i < samplesInBlock; i += channels)
+                        q[i] = decode_u8_mod(q[i - channels], q[i], hdr.quantBits);
+            }
+            else // predictor == 1
+            {
+                const uint32_t mask = (1u << hdr.quantBits) - 1u;
+                for (uint8_t ch = 0; ch < channels; ++ch)
+                {
+                    for (uint32_t f = 1; f < framesInBlock; ++f)
+                    {
+                        const uint32_t idx = f * channels + ch;
+                        const uint8_t diff = q[idx];
+
+                        const uint8_t pred = (f == 1)
+                            ? q[idx - channels]
+                            : static_cast<uint8_t>((2u * q[idx - channels] - q[idx - 2u * channels]) & mask);
+
+                        q[idx] = decode_u8_mod(pred, diff, hdr.quantBits);
+                    }
+                }
+            }
         }
 
         // De-quantize and undo per-channel gain

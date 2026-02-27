@@ -1,33 +1,14 @@
 #pragma once
 
 #include "audioStream.hpp"
-#include "helpers.hpp"
 
 #include <vector>
 
-/*
-class cwv
-{
-    unsigned char channels;
-    unsigned int sampleRate;
-    unsigned long long totalPCMFrameCount;
-    unsigned char bitsPerSample;
-    float gainStep;
-    
-    std::vector<uint8_t> cwvStream;
-
-    //struct gainInfo {};
-
-public:
-    cwv(audioStream stream, uint8_t targetBits);
-};
-*/
-
-// CWV block-based format (CWV3)
+// CWV block-based format (CWV)
 //
 // File layout (little-endian):
 //   Header:
-//     char    magic[4]      = "CWV3"
+//     char    magic[3]      = "CWV"
 //     u8      channels
 //     u32     sampleRate
 //     s64     totalPCMFrameCount
@@ -52,7 +33,7 @@ public:
 
 struct CWVHeader
 {
-    char magic[4];
+    char magic[3];
     uint8_t channels;
     uint32_t sampleRate;
     sf_count_t totalPCMFrameCount;

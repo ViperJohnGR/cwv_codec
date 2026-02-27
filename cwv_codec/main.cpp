@@ -15,7 +15,7 @@ int main(int argc, char** argv)
         return printf("Usage: %s input", getFilenameFromPath(argv[0]).c_str());
 
     int bits = 4;
-    uint32_t blockSize = 4096; // in frames
+    uint32_t blockSize = 512; // in frames
     bool expectbits = false;
     bool expectblock = false;
     bool saveCompressed = false;
