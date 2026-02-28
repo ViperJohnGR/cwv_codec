@@ -15,4 +15,6 @@ struct audioStream
 public:
     audioStream();
     audioStream(const std::string& path);
+
+    bool applyLowPass(float cutoffHz);
 };
