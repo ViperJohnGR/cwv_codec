@@ -17,9 +17,39 @@ constexpr bool kEnableAdaptiveBlockQuantization = true;
 constexpr uint8_t kAdaptiveQuantRadius = 1; // explore nominalBits +/- 1
 constexpr uint8_t kFlagAdaptiveQuantization = 0x80u;
 constexpr uint8_t kFlagVariableBlockSizes = 0x40u;
-constexpr uint32_t kAutoBlockSizeCandidates[] = { 128u, 256u, 512u, 1024u, 2048u };
+constexpr uint32_t kAutoBlockSizeCandidates[] = { 16u, 32u, 64u, 128u, 256u, 512u, 1024u };
 constexpr double kAutoBlockDistortionWeight = 250000.0;
-constexpr double kAutoBlockChangePenaltyBytes = 4.0;
+constexpr double kAutoBlockChangePenaltyBytes = 12.0;
+constexpr double kAutoBlockSizePreferencePenalty = 0.35;
+constexpr uint8_t kAutoBlockQualityMin = 0u;
+constexpr uint8_t kAutoBlockQualityMax = 10u;
+
+constexpr double kAutoBlockMinSizeLog2 = 4.0;  // log2(16)
+constexpr double kAutoBlockMaxSizeLog2 = 10.0; // log2(1024)
+
+double computeAutoBlockDistortionWeight(uint8_t quality)
+{
+    const uint8_t clampedQuality = std::min<uint8_t>(quality, kAutoBlockQualityMax);
+    const double normalizedQuality = static_cast<double>(clampedQuality) / static_cast<double>(kAutoBlockQualityMax);
+    const double exponent = (normalizedQuality - 0.5) * 3.0;
+    return kAutoBlockDistortionWeight * std::pow(16.0, exponent);
+}
+
+double computeAutoBlockChangePenaltyBytes(uint8_t quality)
+{
+    const uint8_t clampedQuality = std::min<uint8_t>(quality, kAutoBlockQualityMax);
+    const double normalizedQuality = static_cast<double>(clampedQuality) / static_cast<double>(kAutoBlockQualityMax);
+    const double exponent = (0.5 - normalizedQuality) * 4.0;
+    return kAutoBlockChangePenaltyBytes * std::pow(2.0, exponent);
+}
+
+double computePreferredAutoBlockSizeLog2(uint8_t quality)
+{
+    const uint8_t clampedQuality = std::min<uint8_t>(quality, kAutoBlockQualityMax);
+    const double normalizedQuality = static_cast<double>(clampedQuality) / static_cast<double>(kAutoBlockQualityMax);
+    return kAutoBlockMaxSizeLog2 + (kAutoBlockMinSizeLog2 - kAutoBlockMaxSizeLog2) * normalizedQuality;
+}
+
 
 uint8_t packGainDb(float gain)
 {
@@ -298,7 +328,7 @@ std::vector<PlannedBlock> buildFixedBlockPlan(uint64_t totalFrames, uint32_t blo
     return plan;
 }
 
-std::vector<PlannedBlock> buildAutoBlockPlan(const audioStream& audio, uint8_t bitsPerSample)
+std::vector<PlannedBlock> buildAutoBlockPlan(const audioStream& audio, uint8_t bitsPerSample, uint8_t quality)
 {
     std::vector<PlannedBlock> plan;
 
@@ -311,6 +341,10 @@ std::vector<PlannedBlock> buildAutoBlockPlan(const audioStream& audio, uint8_t b
     std::vector<float> gain(channels, 1.0f);
     std::vector<uint8_t> gainCode(channels, 0u);
     std::vector<uint8_t> q;
+
+    const double distortionWeight = computeAutoBlockDistortionWeight(quality);
+    const double changePenaltyBytes = computeAutoBlockChangePenaltyBytes(quality);
+    const double preferredBlockSizeLog2 = computePreferredAutoBlockSizeLog2(quality);
 
     uint64_t startFrame = 0;
     uint32_t previousBlockSize = 0;
@@ -331,10 +365,15 @@ std::vector<PlannedBlock> buildAutoBlockPlan(const audioStream& audio, uint8_t b
             const BlockCandidate candidate = evaluateNominalBlock(audio, static_cast<uint32_t>(startFrame), framesInBlock, bitsPerSample, peak, gain, gainCode, q);
             const double bytesPerFrame = static_cast<double>(candidate.encodedBytes) / static_cast<double>(framesInBlock);
             const double distortionPerSample = candidate.distortion / static_cast<double>(framesInBlock * channels);
-            double score = bytesPerFrame + distortionPerSample * kAutoBlockDistortionWeight;
+            const double blockSizeLog2 = std::log2(static_cast<double>(framesInBlock));
+            const double sizePreferencePenalty = std::abs(blockSizeLog2 - preferredBlockSizeLog2) * kAutoBlockSizePreferencePenalty;
+
+            double score = bytesPerFrame
+                + distortionPerSample * distortionWeight
+                + sizePreferencePenalty;
 
             if (previousBlockSize != 0 && previousBlockSize != framesInBlock)
-                score += kAutoBlockChangePenaltyBytes / static_cast<double>(framesInBlock);
+                score += changePenaltyBytes / static_cast<double>(framesInBlock);
 
             if (score < bestScore || (score == bestScore && framesInBlock > bestFrames))
             {
@@ -497,7 +536,7 @@ bool buildVariableBlockPlan(const std::vector<uint8_t>& input, size_t& offset, C
 } // namespace
 
 
-std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uint8_t bitsPerSample, bool saveCompressed)
+std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uint8_t bitsPerSample, bool saveCompressed, uint8_t autoBlockQuality)
 {
     if (audio.channels < 1 || audio.sampleRate <= 0 || audio.totalPCMFrameCount <= 0)
     {
@@ -512,11 +551,12 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
 
     const bool useAdaptiveBlockQuantization = kEnableAdaptiveBlockQuantization;
     const bool useVariableBlockSizes = (blockSizeFrames == 0);
+    autoBlockQuality = std::clamp<uint8_t>(autoBlockQuality, kAutoBlockQualityMin, kAutoBlockQualityMax);
     const uint8_t channels = audio.channels;
     const uint64_t totalFrames = static_cast<uint64_t>(audio.totalPCMFrameCount);
 
     std::vector<PlannedBlock> plan = useVariableBlockSizes
-        ? buildAutoBlockPlan(audio, bitsPerSample)
+        ? buildAutoBlockPlan(audio, bitsPerSample, autoBlockQuality)
         : buildFixedBlockPlan(totalFrames, blockSizeFrames);
 
     if (plan.empty())
@@ -527,6 +567,8 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
 
     const uint32_t numberOfBlocks = static_cast<uint32_t>(plan.size());
     printf("Using %s block plan with %u blocks.\n", useVariableBlockSizes ? "variable-size" : "fixed-size", numberOfBlocks);
+    if (useVariableBlockSizes)
+        printf("Auto block quality = %u/10\n", static_cast<unsigned>(autoBlockQuality));
 
     std::vector<float> peak(channels, 0.0f);
     std::vector<float> gain(channels, 1.0f);

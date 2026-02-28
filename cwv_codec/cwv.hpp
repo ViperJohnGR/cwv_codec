@@ -68,7 +68,7 @@ struct CWVHeader
 };
 
 // Produces a complete CWV file buffer (header + blocks).
-std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uint8_t bitsPerSample, bool saveCompressed);
+std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uint8_t bitsPerSample, bool saveCompressed, uint8_t autoBlockQuality = 5);
 
 // Decodes a CWV file buffer into interleaved float samples. Optionally returns header.
 int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffer, CWVHeader* outHeader = nullptr);

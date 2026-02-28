@@ -13,14 +13,16 @@
 int main(int argc, char** argv)
 {
     if (argc < 2)
-        return printf("Usage: %s input [-bits N] [-block FRAMES|auto] [-lowpass HZ] [-sc]\n", getFilenameFromPath(argv[0]).c_str());
+        return printf("Usage: %s input [-bits N] [-block FRAMES|auto] [-quality 0-10] [-lowpass HZ] [-sc]\n", getFilenameFromPath(argv[0]).c_str());
 
     int bits = 6;
     uint32_t blockSize = 0;
     float lowpassHz = 0.0f;
+    int quality = 5;
     bool expectbits = false;
     bool expectblock = false;
     bool expectlowpass = false;
+    bool expectquality = false;
     bool saveCompressed = false;
 
 
@@ -34,6 +36,8 @@ int main(int argc, char** argv)
             saveCompressed = true;
         else if (strcmp(argv[i], "-lowpass") == 0)
             expectlowpass = true;
+        else if (strcmp(argv[i], "-quality") == 0)
+            expectquality = true;
         else if (expectbits)
         {
             bits = atoi(argv[i]);
@@ -52,12 +56,20 @@ int main(int argc, char** argv)
             lowpassHz = std::max(0.0f, static_cast<float>(atof(argv[i])));
             expectlowpass = 0;
         }
+        else if (expectquality)
+        {
+            quality = std::clamp(atoi(argv[i]), 0, 10);
+            expectquality = 0;
+        }
         else if (getExtensionFromPath(argv[i]) != "cwv")
         {
             printf("Reading input...\n");
             printf("bitsPerSample = %d\n", bits);
             if (blockSize == 0)
+            {
                 printf("blockSize (frames) = auto\n");
+                printf("auto quality = %d/10\n", quality);
+            }
             else
                 printf("blockSize (frames) = %u\n", blockSize);
             if (lowpassHz > 0.0f)
@@ -72,7 +84,7 @@ int main(int argc, char** argv)
 
             printf("Starting encoder...\n");
             const auto encodeStart = std::chrono::steady_clock::now();
-            std::vector<uint8_t> outBuf = encodeCWV(inStream, blockSize, static_cast<uint8_t>(bits), saveCompressed);
+            std::vector<uint8_t> outBuf = encodeCWV(inStream, blockSize, static_cast<uint8_t>(bits), saveCompressed, static_cast<uint8_t>(quality));
             const auto encodeEnd = std::chrono::steady_clock::now();
             const auto encodeMs = std::chrono::duration_cast<std::chrono::milliseconds>(encodeEnd - encodeStart);
             printf("Encoder time: %lld ms (%.3f s)\n", static_cast<long long>(encodeMs.count()), std::chrono::duration<double>(encodeEnd - encodeStart).count());
