@@ -12,19 +12,27 @@
 //     u8      channels
 //     u32     sampleRate
 //     s64     totalPCMFrameCount
-//     u32     blockSize      (in PCM frames)
+//     u32     blockSize      (in PCM frames, 0 = variable-size block plan follows)
 //     u32     numberOfBlocks
-//     u8      quantBits
-//              - legacy files: 1..8 = fixed quantization bits for every block
-//              - adaptive files: bit 7 set, low 7 bits = nominal/target quant bits
+//     u8      quantFlags
+//              - bit 7 = adaptive per-block quantization width present in packInfo
+//              - bit 6 = variable block sizes (header-side change table follows)
+//              - bits 5:0 = nominal quant bits (1..8)
+//
+//     if variable block sizes:
+//       u16    initialBlockSize
+//       u32    blockSizeChangeCount
+//       repeat blockSizeChangeCount times:
+//         u16  deltaFramesFromPreviousChange
+//         u16  newBlockSize
 //
 //   Then for each block:
 //     u8      packInfo
-//              - legacy files:
+//              - non-adaptive files:
 //                  high nibble = predictor (0 = 1st-order, 1 = 2nd-order)
 //                  low  nibble = bitWidth for the block's DPCM payload
 //              - adaptive files:
-//                  high nibble bit 3   = predictor (0 = 1st-order, 1 = 2nd-order)
+//                  high nibble bit 3    = predictor (0 = 1st-order, 1 = 2nd-order)
 //                  high nibble bits 2:0 = block quantBits - 1 (0..7 -> 1..8 bits)
 //                  low  nibble          = bitWidth for the block's DPCM payload
 //     u8      gainCode[channels]  (packed gain in dB, per-channel)
@@ -32,6 +40,9 @@
 //     ...     audioData           (bit-packed interleaved DPCM+zigzag payload for the rest of the block)
 //
 // Notes:
+// - Fixed-size files keep the legacy header layout.
+// - Variable-size files keep block sizes out of the block payload; only size changes are
+//   stored in the header-side change table using frame deltas.
 // - Each block uses a per-channel gain, computed as the gain required to normalize
 //   the block peak for that channel.
 // - Adaptive files keep roughly the same bitrate by choosing a per-block quantization
@@ -43,13 +54,17 @@
 
 struct CWVHeader
 {
-    char magic[3];
-    uint8_t channels;
-    uint32_t sampleRate;
-    sf_count_t totalPCMFrameCount;
-    uint32_t blockSize;
-    uint32_t numberOfBlocks;
-    uint8_t quantBits; // nominal quant bits (adaptive files store the flag in-file only)
+    char magic[3]{};
+    uint8_t channels = 0;
+    uint32_t sampleRate = 0;
+    sf_count_t totalPCMFrameCount = 0;
+    uint32_t blockSize = 0; // fixed-size files only; 0 means variable block sizes
+    uint32_t numberOfBlocks = 0;
+    uint8_t quantBits = 0;  // nominal quant bits only
+    bool adaptiveQuantization = false;
+    bool variableBlockSize = false;
+    uint32_t initialBlockSize = 0;
+    uint32_t blockSizeChangeCount = 0;
 };
 
 // Produces a complete CWV file buffer (header + blocks).
