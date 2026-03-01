@@ -17,15 +17,15 @@ constexpr bool kEnableAdaptiveBlockQuantization = true;
 constexpr uint8_t kAdaptiveQuantRadius = 1; // explore nominalBits +/- 1
 constexpr uint8_t kFlagAdaptiveQuantization = 0x80u;
 constexpr uint8_t kFlagVariableBlockSizes = 0x40u;
-constexpr uint32_t kAutoBlockSizeCandidates[] = { 16u, 32u, 64u, 128u, 256u, 512u, 1024u };
+constexpr uint32_t kAutoBlockSizeCandidates[] = { 8u, 16u, 32u, 64u, 128u, 256u, 512u };
 constexpr double kAutoBlockDistortionWeight = 250000.0;
 constexpr double kAutoBlockChangePenaltyBytes = 12.0;
 constexpr double kAutoBlockSizePreferencePenalty = 0.35;
 constexpr uint8_t kAutoBlockQualityMin = 0u;
 constexpr uint8_t kAutoBlockQualityMax = 10u;
 
-constexpr double kAutoBlockMinSizeLog2 = 4.0;  // log2(16)
-constexpr double kAutoBlockMaxSizeLog2 = 10.0; // log2(1024)
+constexpr double kAutoBlockMinSizeLog2 = 3.0;  // log2(8)
+constexpr double kAutoBlockMaxSizeLog2 = 9.0;  // log2(512)
 
 double computeAutoBlockDistortionWeight(uint8_t quality)
 {
