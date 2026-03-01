@@ -164,6 +164,68 @@ float dequantizeNormalizedCode(uint8_t q, uint8_t bitsPerSample)
     return (static_cast<float>(q) * 2.0f / denom) - 1.0f;
 }
 
+struct DecodeTables
+{
+    float inverseGain[256]{};
+    float dequant[9][256]{};
+    int8_t zigzag[9][256]{};
+};
+
+const DecodeTables& getDecodeTables()
+{
+    static const DecodeTables tables = []
+    {
+        DecodeTables t{};
+        for (uint32_t code = 0; code < 256; ++code)
+            t.inverseGain[code] = 1.0f / unpackGainDb(static_cast<uint8_t>(code));
+
+        for (uint8_t bits = 1; bits <= 8; ++bits)
+            for (uint32_t code = 0; code < 256; ++code)
+            {
+                t.dequant[bits][code] = dequantizeNormalizedCode(static_cast<uint8_t>(code), bits);
+                t.zigzag[bits][code] = zigzag_decode_int8(static_cast<uint8_t>(code), bits);
+            }
+
+        return t;
+    }();
+
+    return tables;
+}
+
+struct PackedBitReader
+{
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    size_t byteIndex = 0;
+    uint64_t buffer = 0;
+    uint32_t bitCount = 0;
+
+    bool read(uint8_t bitWidth, uint8_t& out)
+    {
+        static constexpr uint16_t kMask[9] = { 0u, 0x01u, 0x03u, 0x07u, 0x0Fu, 0x1Fu, 0x3Fu, 0x7Fu, 0xFFu };
+
+        while (bitCount < bitWidth)
+        {
+            if (byteIndex >= size)
+                return false;
+
+            buffer = (buffer << 8) | static_cast<uint64_t>(data[byteIndex++]);
+            bitCount += 8;
+        }
+
+        const uint32_t shift = bitCount - bitWidth;
+        out = static_cast<uint8_t>((buffer >> shift) & kMask[bitWidth]);
+
+        bitCount -= bitWidth;
+        if (bitCount == 0)
+            buffer = 0;
+        else
+            buffer &= ((uint64_t{ 1 } << bitCount) - 1u);
+
+        return true;
+    }
+};
+
 uint32_t computeBestPredictorAndWidth(const std::vector<uint8_t>& q, uint32_t framesInBlock, uint8_t channels, uint8_t bitsPerSample, uint8_t& outPredictor, uint8_t& outPackWidth)
 {
     const uint32_t samplesInBlock = framesInBlock * channels;
@@ -956,7 +1018,7 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
     const bool isCWV = (hdr.magic[0] == 'C' && hdr.magic[1] == 'W' && hdr.magic[2] == 'V');
     if (!isCWV)
     {
-        printf("Error! Not a CWV file (bad magic).\\n");
+        printf("Error! Not a CWV file (bad magic).\n");
         return 1;
     }
 
@@ -1011,32 +1073,16 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
     const uint64_t totalSamples = totalFrames * hdr.channels;
     outputBuffer.assign(static_cast<size_t>(totalSamples), 0.0f);
 
+    const DecodeTables& tables = getDecodeTables();
     const uint8_t channels = hdr.channels;
-    std::vector<float> gain(channels, 1.0f);
-    std::vector<uint8_t> seedPacked;
-    std::vector<uint8_t> payloadPacked;
-    std::vector<uint8_t> seed;
-    std::vector<uint8_t> residual;
-    std::vector<uint8_t> q;
-
-    uint32_t maxFramesInBlock = 0;
-    for (const PlannedBlock& block : plan)
-        maxFramesInBlock = std::max(maxFramesInBlock, block.frames);
-
-    const uint64_t maxSamplesInBlock = static_cast<uint64_t>(maxFramesInBlock) * channels;
-    const uint64_t maxResidual = (maxSamplesInBlock > channels) ? (maxSamplesInBlock - channels) : 0;
-    const uint32_t maxResidualU32 = static_cast<uint32_t>(std::min<uint64_t>(maxResidual, std::numeric_limits<uint32_t>::max()));
-    seedPacked.reserve(calculateBitPackedSize(channels, 8));
-    payloadPacked.reserve(calculateBitPackedSize(maxResidualU32, 8));
-    seed.reserve(channels);
-    residual.reserve(maxResidualU32);
-    q.reserve(static_cast<size_t>(maxSamplesInBlock));
+    std::vector<float> channelScale(channels, 1.0f);
+    std::vector<uint8_t> prev1(channels, 0u);
+    std::vector<uint8_t> prev2(channels, 0u);
 
     for (uint32_t b = 0; b < hdr.numberOfBlocks; ++b)
     {
         const uint32_t startFrame = plan[b].startFrame;
         const uint32_t framesInBlock = plan[b].frames;
-        const uint32_t samplesInBlock = framesInBlock * channels;
         const uint64_t startSample = static_cast<uint64_t>(startFrame) * channels;
 
         if (offset + 1 > input.size())
@@ -1077,7 +1123,7 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
         if (offset + channels > input.size())
             return 1;
         for (uint8_t ch = 0; ch < channels; ++ch)
-            gain[ch] = unpackGainDb(input[offset++]);
+            channelScale[ch] = tables.inverseGain[input[offset++]];
 
         const size_t seedBytes = calculateBitPackedSize(channels, blockQuantBits);
         if (offset + seedBytes > input.size())
@@ -1085,14 +1131,30 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
             printf("Error! Truncated CWV seed samples.\n");
             return 1;
         }
-        seedPacked.assign(input.begin() + offset, input.begin() + offset + seedBytes);
+
+        PackedBitReader seedReader{ input.data() + offset, seedBytes };
         offset += seedBytes;
 
-        seed = unpackBits<uint8_t>(seedPacked, blockQuantBits, channels);
+        const float* dequant = tables.dequant[blockQuantBits];
+        const size_t firstFrameBase = static_cast<size_t>(startSample);
+        for (uint8_t ch = 0; ch < channels; ++ch)
+        {
+            uint8_t code = 0;
+            if (!seedReader.read(blockQuantBits, code))
+            {
+                printf("Error! Truncated CWV seed samples.\n");
+                return 1;
+            }
 
-        const uint32_t seedCount = channels;
-        const uint32_t residualCount = (samplesInBlock > seedCount) ? (samplesInBlock - seedCount) : 0;
+            prev1[ch] = code;
+            prev2[ch] = code;
+            outputBuffer[firstFrameBase + ch] = dequant[code] * channelScale[ch];
+        }
 
+        if (framesInBlock <= 1)
+            continue;
+
+        const uint32_t residualCount = (framesInBlock - 1u) * channels;
         const size_t payloadBytes = calculateBitPackedSize(residualCount, packWidth);
         if (offset + payloadBytes > input.size())
         {
@@ -1100,64 +1162,73 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
             return 1;
         }
 
-        if (payloadBytes > 0)
+        PackedBitReader payloadReader{ input.data() + offset, payloadBytes };
+        offset += payloadBytes;
+
+        const uint32_t mask = (1u << blockQuantBits) - 1u;
+
         {
-            payloadPacked.assign(input.begin() + offset, input.begin() + offset + payloadBytes);
-            offset += payloadBytes;
-        }
-        else
-        {
-            payloadPacked.clear();
-        }
-
-        q.assign(samplesInBlock, 0);
-        for (uint8_t ch = 0; ch < channels; ++ch)
-            q[ch] = seed[ch];
-
-        if (residualCount > 0)
-        {
-            residual = unpackBits<uint8_t>(payloadPacked, packWidth, residualCount);
-            for (uint32_t i = 0; i < residualCount; ++i)
-                q[seedCount + i] = residual[i];
-
-            for (uint32_t i = seedCount; i < samplesInBlock; ++i)
-                q[i] = static_cast<uint8_t>(zigzag_decode_int8(q[i], blockQuantBits));
-
-            if (predictor == 0)
+            const size_t outBase = static_cast<size_t>(startSample + static_cast<uint64_t>(channels));
+            for (uint8_t ch = 0; ch < channels; ++ch)
             {
-                for (uint8_t ch = 0; ch < channels; ++ch)
-                    for (uint32_t i = ch + channels; i < samplesInBlock; i += channels)
-                        q[i] = decode_u8_mod(q[i - channels], q[i], blockQuantBits);
+                uint8_t zz = 0;
+                if (!payloadReader.read(packWidth, zz))
+                {
+                    printf("Error! Truncated CWV block payload.\n");
+                    return 1;
+                }
+
+                const uint8_t diff = static_cast<uint8_t>(zigzag_decode_int8(zz, blockQuantBits));
+                const uint8_t code = static_cast<uint8_t>((prev1[ch] + diff) & mask);
+                prev2[ch] = prev1[ch];
+                prev1[ch] = code;
+                outputBuffer[outBase + ch] = dequant[code] * channelScale[ch];
             }
-            else
+        }
+
+        if (predictor == 0)
+        {
+            for (uint32_t f = 2; f < framesInBlock; ++f)
             {
-                const uint32_t mask = (1u << blockQuantBits) - 1u;
+                const size_t outBase = static_cast<size_t>(startSample + static_cast<uint64_t>(f) * channels);
                 for (uint8_t ch = 0; ch < channels; ++ch)
                 {
-                    for (uint32_t f = 1; f < framesInBlock; ++f)
+                    uint8_t zz = 0;
+                    if (!payloadReader.read(packWidth, zz))
                     {
-                        const uint32_t idx = f * channels + ch;
-                        const uint8_t diff = q[idx];
-
-                        const uint8_t pred = (f == 1)
-                            ? q[idx - channels]
-                            : static_cast<uint8_t>((2u * q[idx - channels] - q[idx - 2u * channels]) & mask);
-
-                        q[idx] = decode_u8_mod(pred, diff, blockQuantBits);
+                        printf("Error! Truncated CWV block payload.\n");
+                        return 1;
                     }
+
+                    const uint8_t diff = static_cast<uint8_t>(tables.zigzag[blockQuantBits][zz]);
+                    const uint8_t code = static_cast<uint8_t>((prev1[ch] + diff) & mask);
+                    prev2[ch] = prev1[ch];
+                    prev1[ch] = code;
+                    outputBuffer[outBase + ch] = dequant[code] * channelScale[ch];
                 }
             }
         }
-
-        for (uint32_t f = 0; f < framesInBlock; ++f)
+        else
         {
-            const uint64_t outBase = startSample + static_cast<uint64_t>(f) * channels;
-            const uint32_t inBase = f * channels;
-            for (uint8_t ch = 0; ch < channels; ++ch)
+            for (uint32_t f = 2; f < framesInBlock; ++f)
             {
-                float s = dequantizeNormalizedCode(q[inBase + ch], blockQuantBits);
-                s /= gain[ch];
-                outputBuffer[static_cast<size_t>(outBase + ch)] = s;
+                const size_t outBase = static_cast<size_t>(startSample + static_cast<uint64_t>(f) * channels);
+                for (uint8_t ch = 0; ch < channels; ++ch)
+                {
+                    uint8_t zz = 0;
+                    if (!payloadReader.read(packWidth, zz))
+                    {
+                        printf("Error! Truncated CWV block payload.\n");
+                        return 1;
+                    }
+
+                    const uint8_t diff = static_cast<uint8_t>(tables.zigzag[blockQuantBits][zz]);
+                    const uint8_t pred = static_cast<uint8_t>((2u * prev1[ch] - prev2[ch]) & mask);
+                    const uint8_t code = static_cast<uint8_t>((pred + diff) & mask);
+                    prev2[ch] = prev1[ch];
+                    prev1[ch] = code;
+                    outputBuffer[outBase + ch] = dequant[code] * channelScale[ch];
+                }
             }
         }
     }
