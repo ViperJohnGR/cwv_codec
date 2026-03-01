@@ -13,7 +13,7 @@
 int main(int argc, char** argv)
 {
     if (argc < 2)
-        return printf("Usage: %s input [-bits N] [-block FRAMES|auto] [-quality 0-10] [-lowpass HZ] [-sc]\n", getFilenameFromPath(argv[0]).c_str());
+        return printf("Usage: %s input [-bits N] [-block FRAMES|auto] [-quality 0-10] [-lowpass HZ] [-normalize] [-sc]\n", getFilenameFromPath(argv[0]).c_str());
 
     int bits = 6;
     uint32_t blockSize = 0;
@@ -24,6 +24,7 @@ int main(int argc, char** argv)
     bool expectlowpass = false;
     bool expectquality = false;
     bool saveCompressed = false;
+    bool normalize = false;
 
 
     for (int i = 1; i < argc; i++)
@@ -34,6 +35,8 @@ int main(int argc, char** argv)
             expectblock = true;
         else if (strcmp(argv[i], "-sc") == 0)
             saveCompressed = true;
+        else if (strcmp(argv[i], "-normalize") == 0)
+            normalize = true;
         else if (strcmp(argv[i], "-lowpass") == 0)
             expectlowpass = true;
         else if (strcmp(argv[i], "-quality") == 0)
@@ -74,12 +77,17 @@ int main(int argc, char** argv)
                 printf("blockSize (frames) = %u\n", blockSize);
             if (lowpassHz > 0.0f)
                 printf("lowpass = %.2f Hz\n", lowpassHz);
+            if (normalize)
+                printf("normalize = on\n");
 
             audioStream inStream(argv[i]);
             if (inStream.channels < 1)
                 return printf("Error! inStream.channels is %d\n", inStream.channels);
 
             if (lowpassHz > 0.0f && !inStream.applyLowPass(lowpassHz))
+                return 1;
+
+            if (normalize && !inStream.normalize())
                 return 1;
 
             printf("Starting encoder...\n");

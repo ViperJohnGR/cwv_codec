@@ -83,6 +83,35 @@ audioStream::audioStream(const std::string& path)
     totalPCMFrameCount = info.frames;
 }
 
+bool audioStream::normalize()
+{
+    if (channels < 1 || sampleRate <= 0 || totalPCMFrameCount <= 0)
+    {
+        printf("Error! Cannot normalize an invalid audio stream.\n");
+        return false;
+    }
+
+    float peak = 0.0f;
+    for (const float sample : sampleData)
+        peak = std::max(peak, std::abs(sample));
+
+    if (peak <= 0.0f)
+    {
+        printf("Warning: input is silent; skipping normalization.\n");
+        return true;
+    }
+
+    if (peak == 1.0f)
+        return true;
+
+    const float gain = 1.0f / peak;
+    for (float& sample : sampleData)
+        sample *= gain;
+
+    printf("Normalized input by %.6fx (peak %.6f -> 1.000000).\n", gain, peak);
+    return true;
+}
+
 bool audioStream::applyLowPass(float cutoffHz)
 {
     if (channels < 1 || sampleRate <= 0 || totalPCMFrameCount <= 0)
