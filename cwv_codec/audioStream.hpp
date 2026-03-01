@@ -17,5 +17,6 @@ public:
     audioStream(const std::string& path);
 
     bool normalize();
+    bool applyGain(float gain);
     bool applyLowPass(float cutoffHz);
 };

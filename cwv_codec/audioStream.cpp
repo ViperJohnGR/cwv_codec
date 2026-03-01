@@ -112,6 +112,24 @@ bool audioStream::normalize()
     return true;
 }
 
+bool audioStream::applyGain(float gain)
+{
+    if (channels < 1 || sampleRate <= 0 || totalPCMFrameCount <= 0)
+    {
+        printf("Error! Cannot apply gain to an invalid audio stream.\n");
+        return false;
+    }
+
+    if (gain == 1.0f)
+        return true;
+
+    for (float& sample : sampleData)
+        sample *= gain;
+
+    printf("Applied gain of %.6fx.\n", gain);
+    return true;
+}
+
 bool audioStream::applyLowPass(float cutoffHz)
 {
     if (channels < 1 || sampleRate <= 0 || totalPCMFrameCount <= 0)

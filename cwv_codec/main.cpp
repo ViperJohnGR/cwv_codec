@@ -13,16 +13,18 @@
 int main(int argc, char** argv)
 {
     if (argc < 2)
-        return printf("Usage: %s input [-bits N] [-block FRAMES|auto] [-quality 0-10] [-lowpass HZ] [-normalize] [-sc]\n", getFilenameFromPath(argv[0]).c_str());
+        return printf("Usage: %s input [-bits N] [-block FRAMES|auto] [-quality 0-10] [-lowpass HZ] [-normalize] [-gain FLOAT] [-sc]\n", getFilenameFromPath(argv[0]).c_str());
 
     int bits = 6;
     uint32_t blockSize = 0;
     float lowpassHz = 0.0f;
     int quality = 5;
+    float gain = 1.0f;
     bool expectbits = false;
     bool expectblock = false;
     bool expectlowpass = false;
     bool expectquality = false;
+    bool expectgain = false;
     bool saveCompressed = false;
     bool normalize = false;
 
@@ -37,6 +39,8 @@ int main(int argc, char** argv)
             saveCompressed = true;
         else if (strcmp(argv[i], "-normalize") == 0)
             normalize = true;
+        else if (strcmp(argv[i], "-gain") == 0)
+            expectgain = true;
         else if (strcmp(argv[i], "-lowpass") == 0)
             expectlowpass = true;
         else if (strcmp(argv[i], "-quality") == 0)
@@ -64,6 +68,11 @@ int main(int argc, char** argv)
             quality = std::clamp(atoi(argv[i]), 0, 10);
             expectquality = 0;
         }
+        else if (expectgain)
+        {
+            gain = static_cast<float>(atof(argv[i]));
+            expectgain = 0;
+        }
         else if (getExtensionFromPath(argv[i]) != "cwv")
         {
             printf("Reading input...\n");
@@ -79,16 +88,21 @@ int main(int argc, char** argv)
                 printf("lowpass = %.2f Hz\n", lowpassHz);
             if (normalize)
                 printf("normalize = on\n");
+            if (gain != 1.0f)
+                printf("gain = %.6f\n", gain);
 
             audioStream inStream(argv[i]);
             if (inStream.channels < 1)
                 return printf("Error! inStream.channels is %d\n", inStream.channels);
 
             if (lowpassHz > 0.0f && !inStream.applyLowPass(lowpassHz))
-                return 1;
+                printf("Failed to apply lowpass at %.2f Hz.\n", lowpassHz);
 
             if (normalize && !inStream.normalize())
-                return 1;
+                printf("Failed to apply normalization.\n");
+
+            if (gain != 1.0f && !inStream.applyGain(gain))
+                printf("Failed to apply gain %.6f\n", gain);
 
             printf("Starting encoder...\n");
             const auto encodeStart = std::chrono::steady_clock::now();
