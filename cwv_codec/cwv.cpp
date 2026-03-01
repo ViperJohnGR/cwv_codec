@@ -67,59 +67,69 @@ float unpackGainDb(uint8_t code)
     return std::pow(10.0f, db / 20.0f);
 }
 
-uint8_t diff_u8_mod(uint32_t a, uint32_t b, uint8_t bitsPerSample)
+uint8_t computePredictedCode(uint8_t predictor, uint32_t frameIndex, uint8_t prev1, uint8_t prev2, uint8_t bitsPerSample)
 {
-    if (!(bitsPerSample >= 1 && bitsPerSample <= 8))
+    const int qMax = static_cast<int>((1u << bitsPerSample) - 1u);
+
+    if (predictor == 0 || frameIndex <= 1u)
+        return prev1;
+
+    const int predicted = 2 * static_cast<int>(prev1) - static_cast<int>(prev2);
+    return static_cast<uint8_t>(std::clamp(predicted, 0, qMax));
+}
+
+uint8_t computeResidualPeakFromSource(const std::vector<uint8_t>& q, uint32_t framesInBlock, uint8_t channels, uint8_t bitsPerSample, uint8_t predictor)
+{
+    if (framesInBlock <= 1 || channels == 0)
         return 0;
 
-    const uint32_t mask = (1u << bitsPerSample) - 1u;
-    a &= mask;
-    b &= mask;
-    return static_cast<uint8_t>((a - b) & mask);
+    int maxAbsResidual = 0;
+    for (uint8_t ch = 0; ch < channels; ++ch)
+    {
+        uint8_t prev2 = q[ch];
+        uint8_t prev1 = q[ch];
+
+        for (uint32_t f = 1; f < framesInBlock; ++f)
+        {
+            const uint32_t idx = f * channels + ch;
+            const uint8_t cur = q[idx];
+            const uint8_t pred = computePredictedCode(predictor, f, prev1, prev2, bitsPerSample);
+            const int residual = static_cast<int>(cur) - static_cast<int>(pred);
+            maxAbsResidual = std::max(maxAbsResidual, std::abs(residual));
+
+            prev2 = prev1;
+            prev1 = cur;
+        }
+    }
+
+    return static_cast<uint8_t>(std::min(maxAbsResidual, 255));
 }
 
-uint8_t decode_u8_mod(uint32_t b, uint32_t diff, uint8_t bitsPerSample)
+uint8_t encodeScaledResidual(int residual, uint8_t packWidth, uint8_t residualPeak)
 {
-    if (!(bitsPerSample >= 1 && bitsPerSample <= 8))
+    if (packWidth < 2 || packWidth > 8)
         return 0;
 
-    const uint32_t mask = (1u << bitsPerSample) - 1u;
-    b &= mask;
-    diff &= mask;
-    return static_cast<uint8_t>((b + diff) & mask);
+    if (residualPeak == 0)
+        return static_cast<uint8_t>(1u << (packWidth - 1u));
+
+    const int levelAbsMax = 1 << (packWidth - 1u);
+    const double scaled = static_cast<double>(residual) * static_cast<double>(levelAbsMax) / static_cast<double>(residualPeak);
+    const int level = std::clamp(static_cast<int>(std::lround(scaled)), -levelAbsMax, levelAbsMax - 1);
+    return static_cast<uint8_t>(level + levelAbsMax);
 }
 
-constexpr std::uint8_t zigzag_encode_int8(std::int8_t value, std::uint8_t bits)
+int decodeScaledResidual(uint8_t code, uint8_t packWidth, uint8_t residualPeak)
 {
-    if (bits == 0 || bits > 8) return 0;
+    if (packWidth < 2 || packWidth > 8 || residualPeak == 0)
+        return 0;
 
-    const std::uint16_t mask = (bits == 8) ? 0xFFu : static_cast<std::uint16_t>((1u << bits) - 1u);
-    std::uint16_t u = static_cast<std::uint16_t>(static_cast<std::uint8_t>(value)) & mask;
+    const int levelAbsMax = 1 << (packWidth - 1u);
+    const int level = static_cast<int>(code) - levelAbsMax;
+    if (level == 0)
+        return 0;
 
-    const std::uint16_t signbit = static_cast<std::uint16_t>(1u << (bits - 1u));
-    if (u & signbit) u |= static_cast<std::uint16_t>(~mask); // sign-extend
-
-    const std::int16_t s = static_cast<std::int16_t>(u);
-    const std::uint16_t zz = (static_cast<std::uint16_t>(s) << 1)
-        ^ static_cast<std::uint16_t>(-static_cast<std::int16_t>(s < 0));
-
-    return static_cast<std::uint8_t>(zz & mask);
-}
-
-constexpr std::int8_t zigzag_decode_int8(std::uint8_t zigzag, std::uint8_t bits)
-{
-    if (bits == 0 || bits > 8) return 0;
-
-    const std::uint16_t mask = (bits == 8) ? 0xFFu : static_cast<std::uint16_t>((1u << bits) - 1u);
-    const std::uint16_t zz = static_cast<std::uint16_t>(zigzag) & mask;
-
-    std::uint16_t raw = (zz >> 1) ^ static_cast<std::uint16_t>(-static_cast<std::int16_t>(zz & 1u));
-    raw &= mask;
-
-    const std::uint16_t signbit = static_cast<std::uint16_t>(1u << (bits - 1u));
-    if (raw & signbit) raw |= static_cast<std::uint16_t>(~mask); // sign-extend
-
-    return static_cast<std::int8_t>(static_cast<std::int16_t>(raw));
+    return static_cast<int>(std::lround(static_cast<double>(level) * static_cast<double>(residualPeak) / static_cast<double>(levelAbsMax)));
 }
 
 template <class T>
@@ -168,7 +178,6 @@ struct DecodeTables
 {
     float inverseGain[256]{};
     float dequant[9][256]{};
-    int8_t zigzag[9][256]{};
 };
 
 const DecodeTables& getDecodeTables()
@@ -181,10 +190,7 @@ const DecodeTables& getDecodeTables()
 
         for (uint8_t bits = 1; bits <= 8; ++bits)
             for (uint32_t code = 0; code < 256; ++code)
-            {
                 t.dequant[bits][code] = dequantizeNormalizedCode(static_cast<uint8_t>(code), bits);
-                t.zigzag[bits][code] = zigzag_decode_int8(static_cast<uint8_t>(code), bits);
-            }
 
         return t;
     }();
@@ -226,66 +232,12 @@ struct PackedBitReader
     }
 };
 
-uint32_t computeBestPredictorAndWidth(const std::vector<uint8_t>& q, uint32_t framesInBlock, uint8_t channels, uint8_t bitsPerSample, uint8_t& outPredictor, uint8_t& outPackWidth)
-{
-    const uint32_t samplesInBlock = framesInBlock * channels;
-    const uint32_t residualCount = (samplesInBlock > channels) ? (samplesInBlock - channels) : 0;
-
-    if (residualCount == 0)
-    {
-        outPredictor = 0;
-        outPackWidth = 1;
-        return 1u + channels + static_cast<uint32_t>(calculateBitPackedSize(channels, bitsPerSample));
-    }
-
-    const uint32_t mask = (1u << bitsPerSample) - 1u;
-
-    auto measurePredictor = [&](uint8_t predictor) -> uint8_t
-    {
-        uint32_t maxv = 0;
-        for (uint8_t ch = 0; ch < channels; ++ch)
-        {
-            uint8_t prev2 = q[ch];
-            uint8_t prev1 = q[ch];
-
-            for (uint32_t f = 1; f < framesInBlock; ++f)
-            {
-                const uint32_t idx = f * channels + ch;
-                const uint8_t cur = q[idx];
-                const uint8_t pred =
-                    (predictor == 0 || f == 1)
-                    ? prev1
-                    : static_cast<uint8_t>((2u * prev1 - prev2) & mask);
-
-                const uint8_t diff = diff_u8_mod(cur, pred, bitsPerSample);
-                const uint8_t zz = zigzag_encode_int8(static_cast<int8_t>(diff), bitsPerSample);
-                maxv = std::max<uint32_t>(maxv, zz);
-
-                prev2 = prev1;
-                prev1 = cur;
-            }
-        }
-
-        return static_cast<uint8_t>(std::max<uint32_t>(1, std::bit_width(maxv)));
-    };
-
-    const uint8_t width0 = measurePredictor(0);
-    const uint8_t width1 = measurePredictor(1);
-
-    outPredictor = (width1 < width0) ? 1u : 0u;
-    outPackWidth = (outPredictor == 0) ? width0 : width1;
-
-    return 1u
-        + channels
-        + static_cast<uint32_t>(calculateBitPackedSize(channels, bitsPerSample))
-        + static_cast<uint32_t>(calculateBitPackedSize(residualCount, outPackWidth));
-}
-
 struct BlockCandidate
 {
     uint8_t quantBits = 0;
     uint8_t predictor = 0;
-    uint8_t packWidth = 1;
+    uint8_t packWidth = 0;
+    uint8_t residualPeak = 0;
     uint32_t encodedBytes = 0;
     double distortion = 0.0;
 };
@@ -336,20 +288,88 @@ void computeBlockGain(const audioStream& audio, uint64_t startSample, uint32_t f
     }
 }
 
+BlockCandidate evaluateScaledBlockCandidate(const audioStream& audio, uint32_t startFrame, uint32_t framesInBlock, uint8_t blockQuantBits,
+    uint8_t predictor, uint8_t packWidth, const std::vector<float>& gain, const std::vector<uint8_t>& q)
+{
+    BlockCandidate candidate{};
+    candidate.quantBits = blockQuantBits;
+    candidate.predictor = predictor;
+    candidate.packWidth = packWidth;
+
+    const uint8_t channels = audio.channels;
+    const uint32_t samplesInBlock = framesInBlock * channels;
+    const uint32_t residualCount = (samplesInBlock > channels) ? (samplesInBlock - channels) : 0;
+    const uint32_t qMax = (1u << blockQuantBits) - 1u;
+    const uint64_t startSample = static_cast<uint64_t>(startFrame) * channels;
+
+    candidate.residualPeak = computeResidualPeakFromSource(q, framesInBlock, channels, blockQuantBits, predictor);
+    if (candidate.residualPeak == 0)
+        candidate.packWidth = 0;
+
+    candidate.encodedBytes = 1u
+        + channels
+        + 1u
+        + static_cast<uint32_t>(calculateBitPackedSize(channels, blockQuantBits))
+        + ((candidate.packWidth == 0 || residualCount == 0) ? 0u : static_cast<uint32_t>(calculateBitPackedSize(residualCount, candidate.packWidth)));
+
+    std::vector<uint8_t> prev1(channels, 0u);
+    std::vector<uint8_t> prev2(channels, 0u);
+    candidate.distortion = 0.0;
+
+    for (uint8_t ch = 0; ch < channels; ++ch)
+    {
+        const uint8_t seedCode = q[ch];
+        prev1[ch] = seedCode;
+        prev2[ch] = seedCode;
+        const float reconstructed = dequantizeNormalizedCode(seedCode, blockQuantBits) / gain[ch];
+        const double err = static_cast<double>(reconstructed) - static_cast<double>(audio.sampleData[startSample + ch]);
+        candidate.distortion += err * err;
+    }
+
+    for (uint32_t f = 1; f < framesInBlock; ++f)
+    {
+        const uint64_t inBase = startSample + static_cast<uint64_t>(f) * channels;
+        for (uint8_t ch = 0; ch < channels; ++ch)
+        {
+            const uint32_t idx = f * channels + ch;
+            const uint8_t pred = computePredictedCode(candidate.predictor, f, prev1[ch], prev2[ch], blockQuantBits);
+            const int residual = static_cast<int>(q[idx]) - static_cast<int>(pred);
+
+            uint8_t residualCode = 0;
+            int reconstructedResidual = 0;
+            if (candidate.packWidth != 0)
+            {
+                residualCode = encodeScaledResidual(residual, candidate.packWidth, candidate.residualPeak);
+                reconstructedResidual = decodeScaledResidual(residualCode, candidate.packWidth, candidate.residualPeak);
+            }
+
+            const uint8_t reconstructedCode = static_cast<uint8_t>(std::clamp(static_cast<int>(pred) + reconstructedResidual, 0, static_cast<int>(qMax)));
+            prev2[ch] = prev1[ch];
+            prev1[ch] = reconstructedCode;
+
+            const float reconstructed = dequantizeNormalizedCode(reconstructedCode, blockQuantBits) / gain[ch];
+            const double err = static_cast<double>(reconstructed) - static_cast<double>(audio.sampleData[inBase + ch]);
+            candidate.distortion += err * err;
+        }
+    }
+
+    return candidate;
+}
+
 BlockCandidate evaluateNominalBlock(const audioStream& audio, uint32_t startFrame, uint32_t framesInBlock, uint8_t bitsPerSample,
     std::vector<float>& peak, std::vector<float>& gain, std::vector<uint8_t>& gainCode, std::vector<uint8_t>& q)
 {
-    BlockCandidate candidate{};
-    candidate.quantBits = bitsPerSample;
+    BlockCandidate bestCandidate{};
+    bool haveBest = false;
 
     const uint8_t channels = audio.channels;
     const uint32_t samplesInBlock = framesInBlock * channels;
     const uint64_t startSample = static_cast<uint64_t>(startFrame) * channels;
+    const uint8_t nominalPackWidth = (framesInBlock <= 1) ? 0u : std::max<uint8_t>(2u, bitsPerSample);
 
     computeBlockGain(audio, startSample, framesInBlock, channels, peak, gain, gainCode);
 
     q.resize(samplesInBlock);
-    candidate.distortion = 0.0;
     for (uint32_t f = 0; f < framesInBlock; ++f)
     {
         const uint64_t inBase = startSample + static_cast<uint64_t>(f) * channels;
@@ -357,17 +377,23 @@ BlockCandidate evaluateNominalBlock(const audioStream& audio, uint32_t startFram
         for (uint8_t ch = 0; ch < channels; ++ch)
         {
             const float normalized = std::clamp(audio.sampleData[inBase + ch] * gain[ch], -1.0f, 1.0f);
-            const uint8_t code = quantizeNormalizedSample(normalized, bitsPerSample);
-            q[outBase + ch] = code;
-
-            const float reconstructed = dequantizeNormalizedCode(code, bitsPerSample) / gain[ch];
-            const double err = static_cast<double>(reconstructed) - static_cast<double>(audio.sampleData[inBase + ch]);
-            candidate.distortion += err * err;
+            q[outBase + ch] = quantizeNormalizedSample(normalized, bitsPerSample);
         }
     }
 
-    candidate.encodedBytes = computeBestPredictorAndWidth(q, framesInBlock, channels, bitsPerSample, candidate.predictor, candidate.packWidth);
-    return candidate;
+    for (uint8_t predictor = 0; predictor <= 1; ++predictor)
+    {
+        const BlockCandidate candidate = evaluateScaledBlockCandidate(audio, startFrame, framesInBlock, bitsPerSample, predictor, nominalPackWidth, gain, q);
+        if (!haveBest
+            || candidate.distortion < bestCandidate.distortion
+            || (candidate.distortion == bestCandidate.distortion && candidate.encodedBytes < bestCandidate.encodedBytes))
+        {
+            bestCandidate = candidate;
+            haveBest = true;
+        }
+    }
+
+    return bestCandidate;
 }
 
 std::vector<PlannedBlock> buildFixedBlockPlan(uint64_t totalFrames, uint32_t blockSizeFrames)
@@ -683,15 +709,14 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
             ? static_cast<uint8_t>(std::min<int>(8, static_cast<int>(bitsPerSample) + static_cast<int>(kAdaptiveQuantRadius)))
             : bitsPerSample;
 
-        blockCandidates[b].reserve(useAdaptiveBlockQuantization ? static_cast<size_t>(maxQuantBits - minQuantBits + 1u) : 1u);
+        blockCandidates[b].reserve(useAdaptiveBlockQuantization ? static_cast<size_t>((maxQuantBits - minQuantBits + 1u) * 16u) : 16u);
 
+        bool haveNominalSelection = false;
         for (uint8_t blockQuantBits = (useAdaptiveBlockQuantization ? minQuantBits : bitsPerSample);
              blockQuantBits <= (useAdaptiveBlockQuantization ? maxQuantBits : bitsPerSample);
              ++blockQuantBits)
         {
             q.resize(samplesInBlock);
-
-            double distortion = 0.0;
             for (uint32_t f = 0; f < framesInBlock; ++f)
             {
                 const uint64_t inBase = startSample + static_cast<uint64_t>(f) * channels;
@@ -699,30 +724,62 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
                 for (uint8_t ch = 0; ch < channels; ++ch)
                 {
                     const float normalized = std::clamp(audio.sampleData[inBase + ch] * gain[ch], -1.0f, 1.0f);
-                    const uint8_t code = quantizeNormalizedSample(normalized, blockQuantBits);
-                    q[outBase + ch] = code;
-
-                    const float reconstructed = dequantizeNormalizedCode(code, blockQuantBits) / gain[ch];
-                    const double err = static_cast<double>(reconstructed) - static_cast<double>(audio.sampleData[inBase + ch]);
-                    distortion += err * err;
+                    q[outBase + ch] = quantizeNormalizedSample(normalized, blockQuantBits);
                 }
             }
 
-            BlockCandidate candidate{};
-            candidate.quantBits = blockQuantBits;
-            candidate.distortion = distortion;
-            candidate.encodedBytes = computeBestPredictorAndWidth(q, framesInBlock, channels, blockQuantBits, candidate.predictor, candidate.packWidth);
-            blockCandidates[b].push_back(candidate);
+            const uint8_t nominalPackWidth = (framesInBlock <= 1) ? 0u : static_cast<uint8_t>(std::max<int>(2, blockQuantBits));
+            const uint8_t maxPackWidth = (framesInBlock <= 1) ? 0u : static_cast<uint8_t>(std::max<int>(2, blockQuantBits));
 
-            if (blockQuantBits == bitsPerSample)
+            for (uint8_t predictor = 0; predictor <= 1; ++predictor)
             {
-                selected[b] = candidate;
-                targetPayloadBytes += candidate.encodedBytes;
+                if (framesInBlock <= 1)
+                {
+                    const BlockCandidate candidate = evaluateScaledBlockCandidate(audio, startFrame, framesInBlock, blockQuantBits, predictor, 0u, gain, q);
+                    blockCandidates[b].push_back(candidate);
+
+                    if (blockQuantBits == bitsPerSample
+                        && (!haveNominalSelection
+                            || candidate.distortion < selected[b].distortion
+                            || (candidate.distortion == selected[b].distortion && candidate.encodedBytes < selected[b].encodedBytes)))
+                    {
+                        selected[b] = candidate;
+                        haveNominalSelection = true;
+                    }
+                    continue;
+                }
+
+                for (uint8_t packWidth = 2; packWidth <= maxPackWidth; ++packWidth)
+                {
+                    const BlockCandidate candidate = evaluateScaledBlockCandidate(audio, startFrame, framesInBlock, blockQuantBits, predictor, packWidth, gain, q);
+                    blockCandidates[b].push_back(candidate);
+
+                    if (blockQuantBits == bitsPerSample
+                        && (packWidth == nominalPackWidth || candidate.packWidth == 0)
+                        && (!haveNominalSelection
+                            || candidate.distortion < selected[b].distortion
+                            || (candidate.distortion == selected[b].distortion && candidate.encodedBytes < selected[b].encodedBytes)))
+                    {
+                        selected[b] = candidate;
+                        haveNominalSelection = true;
+                    }
+
+                    if (candidate.packWidth == 0)
+                        break;
+                }
             }
 
             if (!useAdaptiveBlockQuantization)
                 break;
         }
+
+        if (!haveNominalSelection)
+        {
+            printf("Error! Failed to select a nominal block candidate.\n");
+            return {};
+        }
+
+        targetPayloadBytes += selected[b].encodedBytes;
     }
 
     if (useAdaptiveBlockQuantization)
@@ -897,8 +954,6 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
         const uint8_t predictor = selected[b].predictor;
         const uint32_t seedCount = channels;
         const uint32_t residualCount = (samplesInBlock > seedCount) ? (samplesInBlock - seedCount) : 0;
-        const uint32_t mask = (1u << blockQuantBits) - 1u;
-
         computeBlockGain(audio, startSample, framesInBlock, channels, peak, gain, gainCode);
 
         q.resize(samplesInBlock);
@@ -915,37 +970,36 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
 
         std::copy_n(q.begin(), seedCount, seed.begin());
 
-        uint8_t packWidth = 1;
-        residual.resize(residualCount);
-        if (residualCount > 0)
+        const uint8_t packWidth = selected[b].packWidth;
+        const uint8_t residualPeak = selected[b].residualPeak;
+        residual.resize((packWidth == 0) ? 0u : residualCount);
+        if (packWidth != 0 && residualCount > 0)
         {
-            uint32_t maxv = 0;
+            std::vector<uint8_t> prev1State(channels, 0u);
+            std::vector<uint8_t> prev2State(channels, 0u);
             for (uint8_t ch = 0; ch < channels; ++ch)
             {
-                uint8_t prev2 = q[ch];
-                uint8_t prev1 = q[ch];
-
-                for (uint32_t f = 1; f < framesInBlock; ++f)
-                {
-                    const uint32_t idx = f * channels + ch;
-                    const uint8_t cur = q[idx];
-                    const uint8_t pred =
-                        (predictor == 0 || f == 1)
-                        ? prev1
-                        : static_cast<uint8_t>((2u * prev1 - prev2) & mask);
-
-                    const uint8_t diff = diff_u8_mod(cur, pred, blockQuantBits);
-                    const uint8_t zz = zigzag_encode_int8(static_cast<int8_t>(diff), blockQuantBits);
-                    const uint32_t rIdx = (f - 1u) * channels + ch;
-                    residual[rIdx] = zz;
-                    maxv = std::max<uint32_t>(maxv, zz);
-
-                    prev2 = prev1;
-                    prev1 = cur;
-                }
+                prev1State[ch] = q[ch];
+                prev2State[ch] = q[ch];
             }
 
-            packWidth = static_cast<uint8_t>(std::max<uint32_t>(1, std::bit_width(maxv)));
+            for (uint32_t f = 1; f < framesInBlock; ++f)
+            {
+                for (uint8_t ch = 0; ch < channels; ++ch)
+                {
+                    const uint32_t idx = f * channels + ch;
+                    const uint8_t pred = computePredictedCode(predictor, f, prev1State[ch], prev2State[ch], blockQuantBits);
+                    const int residualValue = static_cast<int>(q[idx]) - static_cast<int>(pred);
+                    const uint8_t residualCode = encodeScaledResidual(residualValue, packWidth, residualPeak);
+                    const int reconstructedResidual = decodeScaledResidual(residualCode, packWidth, residualPeak);
+                    const uint8_t reconstructedCode = static_cast<uint8_t>(std::clamp(static_cast<int>(pred) + reconstructedResidual, 0, static_cast<int>((1u << blockQuantBits) - 1u)));
+                    const uint32_t rIdx = (f - 1u) * channels + ch;
+                    residual[rIdx] = residualCode;
+
+                    prev2State[ch] = prev1State[ch];
+                    prev1State[ch] = reconstructedCode;
+                }
+            }
         }
 
         uint8_t packInfo = 0;
@@ -962,11 +1016,12 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
         out.push_back(packInfo);
         for (uint8_t ch = 0; ch < channels; ++ch)
             out.push_back(gainCode[ch]);
+        out.push_back(residualPeak);
 
         const BitPack seedPacked = packBitsFixed<uint8_t>(seed, blockQuantBits);
         out.insert(out.end(), seedPacked.bytes.begin(), seedPacked.bytes.end());
 
-        if (residualCount > 0)
+        if (packWidth != 0 && residualCount > 0)
         {
             const BitPack residualPacked = packBitsFixed<uint8_t>(residual, packWidth);
             out.insert(out.end(), residualPacked.bytes.begin(), residualPacked.bytes.end());
@@ -1104,7 +1159,7 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
             predictor = static_cast<uint8_t>(packInfo >> 4);
         }
 
-        if (packWidth < 1 || packWidth > 8)
+        if (packWidth > 8)
         {
             printf("Error! Invalid block packWidth (%u).\n", packWidth);
             return 1;
@@ -1124,6 +1179,13 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
             return 1;
         for (uint8_t ch = 0; ch < channels; ++ch)
             channelScale[ch] = tables.inverseGain[input[offset++]];
+
+        if (offset + 1 > input.size())
+        {
+            printf("Error! Truncated CWV residual scale.\n");
+            return 1;
+        }
+        const uint8_t residualPeak = input[offset++];
 
         const size_t seedBytes = calculateBitPackedSize(channels, blockQuantBits);
         if (offset + seedBytes > input.size())
@@ -1154,8 +1216,14 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
         if (framesInBlock <= 1)
             continue;
 
+        if (packWidth == 0 && residualPeak != 0)
+        {
+            printf("Error! Invalid CWV residual block scale/width combination.\n");
+            return 1;
+        }
+
         const uint32_t residualCount = (framesInBlock - 1u) * channels;
-        const size_t payloadBytes = calculateBitPackedSize(residualCount, packWidth);
+        const size_t payloadBytes = (packWidth == 0) ? 0u : calculateBitPackedSize(residualCount, packWidth);
         if (offset + payloadBytes > input.size())
         {
             printf("Error! Truncated CWV block payload.\n");
@@ -1165,70 +1233,28 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
         PackedBitReader payloadReader{ input.data() + offset, payloadBytes };
         offset += payloadBytes;
 
-        const uint32_t mask = (1u << blockQuantBits) - 1u;
-
+        const int qMax = static_cast<int>((1u << blockQuantBits) - 1u);
+        for (uint32_t f = 1; f < framesInBlock; ++f)
         {
-            const size_t outBase = static_cast<size_t>(startSample + static_cast<uint64_t>(channels));
+            const size_t outBase = static_cast<size_t>(startSample + static_cast<uint64_t>(f) * channels);
             for (uint8_t ch = 0; ch < channels; ++ch)
             {
-                uint8_t zz = 0;
-                if (!payloadReader.read(packWidth, zz))
+                uint8_t residualCode = 0;
+                if (packWidth != 0)
                 {
-                    printf("Error! Truncated CWV block payload.\n");
-                    return 1;
+                    if (!payloadReader.read(packWidth, residualCode))
+                    {
+                        printf("Error! Truncated CWV block payload.\n");
+                        return 1;
+                    }
                 }
 
-                const uint8_t diff = static_cast<uint8_t>(zigzag_decode_int8(zz, blockQuantBits));
-                const uint8_t code = static_cast<uint8_t>((prev1[ch] + diff) & mask);
+                const uint8_t pred = computePredictedCode(predictor, f, prev1[ch], prev2[ch], blockQuantBits);
+                const int residual = decodeScaledResidual(residualCode, packWidth, residualPeak);
+                const uint8_t code = static_cast<uint8_t>(std::clamp(static_cast<int>(pred) + residual, 0, qMax));
                 prev2[ch] = prev1[ch];
                 prev1[ch] = code;
                 outputBuffer[outBase + ch] = dequant[code] * channelScale[ch];
-            }
-        }
-
-        if (predictor == 0)
-        {
-            for (uint32_t f = 2; f < framesInBlock; ++f)
-            {
-                const size_t outBase = static_cast<size_t>(startSample + static_cast<uint64_t>(f) * channels);
-                for (uint8_t ch = 0; ch < channels; ++ch)
-                {
-                    uint8_t zz = 0;
-                    if (!payloadReader.read(packWidth, zz))
-                    {
-                        printf("Error! Truncated CWV block payload.\n");
-                        return 1;
-                    }
-
-                    const uint8_t diff = static_cast<uint8_t>(tables.zigzag[blockQuantBits][zz]);
-                    const uint8_t code = static_cast<uint8_t>((prev1[ch] + diff) & mask);
-                    prev2[ch] = prev1[ch];
-                    prev1[ch] = code;
-                    outputBuffer[outBase + ch] = dequant[code] * channelScale[ch];
-                }
-            }
-        }
-        else
-        {
-            for (uint32_t f = 2; f < framesInBlock; ++f)
-            {
-                const size_t outBase = static_cast<size_t>(startSample + static_cast<uint64_t>(f) * channels);
-                for (uint8_t ch = 0; ch < channels; ++ch)
-                {
-                    uint8_t zz = 0;
-                    if (!payloadReader.read(packWidth, zz))
-                    {
-                        printf("Error! Truncated CWV block payload.\n");
-                        return 1;
-                    }
-
-                    const uint8_t diff = static_cast<uint8_t>(tables.zigzag[blockQuantBits][zz]);
-                    const uint8_t pred = static_cast<uint8_t>((2u * prev1[ch] - prev2[ch]) & mask);
-                    const uint8_t code = static_cast<uint8_t>((pred + diff) & mask);
-                    prev2[ch] = prev1[ch];
-                    prev1[ch] = code;
-                    outputBuffer[outBase + ch] = dequant[code] * channelScale[ch];
-                }
             }
         }
     }

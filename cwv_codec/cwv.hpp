@@ -30,17 +30,19 @@
 //     u8      packInfo
 //              - non-adaptive files:
 //                  high nibble = predictor (0 = 1st-order, 1 = 2nd-order)
-//                  low  nibble = bitWidth for the block's DPCM payload
+//                  low  nibble = residual bit width for the block payload (0 = implicit zero residuals)
 //              - adaptive files:
 //                  high nibble bit 3    = predictor (0 = 1st-order, 1 = 2nd-order)
 //                  high nibble bits 2:0 = block quantBits - 1 (0..7 -> 1..8 bits)
-//                  low  nibble          = bitWidth for the block's DPCM payload
+//                  low  nibble          = residual bit width for the block payload (0 = implicit zero residuals)
 //     u8      gainCode[channels]  (packed gain in dB, per-channel)
+//     u8      residualPeak        (maximum absolute predictor residual in quantized-code units)
 //     ...     seedSamples         (first-frame samples, packed with the block quant bits)
-//     ...     audioData           (bit-packed interleaved DPCM+zigzag payload for the rest of the block)
+//     ...     audioData           (bit-packed interleaved scaled-DPCM payload for the rest of the block)
 //
 // Notes:
-// - Fixed-size files keep the legacy header layout.
+// - This format revision is intentionally not backward compatible with the previous
+//   exact-delta / zigzag residual stream.
 // - Variable-size files keep block sizes out of the block payload; only size changes are
 //   stored in the header-side change table using frame deltas.
 // - Each block uses a per-channel gain, computed as the gain required to normalize
@@ -48,9 +50,9 @@
 // - Adaptive files keep roughly the same bitrate by choosing a per-block quantization
 //   width near the requested nominal width.
 // - The first frame (one sample per channel) is stored as absolute values (seedSamples).
-// - The rest of the samples are stored as per-channel DPCM diffs (mod 2^quantBits)
-//   followed by zigzag, then bit-packed using the smallest bitWidth that fits that
-//   block's payload.
+// - The rest of the samples are stored as predictor residual buckets. For example,
+//   a 4-bit residual stream carries 16 scaled residual levels across that block's
+//   residualPeak range instead of exact +/- step deltas.
 
 struct CWVHeader
 {
