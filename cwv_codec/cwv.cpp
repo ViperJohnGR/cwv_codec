@@ -349,6 +349,26 @@ std::vector<PlannedBlock> buildAutoBlockPlan(const audioStream& audio, uint8_t b
     uint64_t startFrame = 0;
     uint32_t previousBlockSize = 0;
 
+    uint32_t lastBlockAnalysisProgressPercent = std::numeric_limits<uint32_t>::max();
+    auto printBlockAnalysisProgress = [&](uint64_t completedFrames)
+    {
+        if (totalFrames == 0)
+            return;
+
+        const uint32_t percent = static_cast<uint32_t>((completedFrames * 100u) / totalFrames);
+        if (percent == lastBlockAnalysisProgressPercent)
+            return;
+
+        printf("\rBlock size analysis progress: %3u%% (%llu/%llu frames)",
+            percent,
+            static_cast<unsigned long long>(completedFrames),
+            static_cast<unsigned long long>(totalFrames));
+        fflush(stdout);
+        lastBlockAnalysisProgressPercent = percent;
+    };
+
+    printBlockAnalysisProgress(0);
+
     while (startFrame < totalFrames)
     {
         const uint64_t remaining = totalFrames - startFrame;
@@ -401,7 +421,11 @@ std::vector<PlannedBlock> buildAutoBlockPlan(const audioStream& audio, uint8_t b
         plan.push_back({ static_cast<uint32_t>(startFrame), bestFrames });
         startFrame += bestFrames;
         previousBlockSize = bestFrames;
+        printBlockAnalysisProgress(startFrame);
     }
+
+    if (lastBlockAnalysisProgressPercent != std::numeric_limits<uint32_t>::max())
+        printf("\n");
 
     return plan;
 }
@@ -784,6 +808,23 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
 
     printf("Encoding %u blocks...\n", numberOfBlocks);
 
+    uint32_t lastEncodeProgressPercent = std::numeric_limits<uint32_t>::max();
+    auto printEncodeProgress = [&](uint32_t completedBlocks)
+    {
+        if (numberOfBlocks == 0)
+            return;
+
+        const uint32_t percent = (completedBlocks * 100u) / numberOfBlocks;
+        if (percent == lastEncodeProgressPercent)
+            return;
+
+        printf("\rEncoding progress: %3u%% (%u/%u blocks)", percent, completedBlocks, numberOfBlocks);
+        fflush(stdout);
+        lastEncodeProgressPercent = percent;
+    };
+
+    printEncodeProgress(0);
+
     for (uint32_t b = 0; b < numberOfBlocks; ++b)
     {
         const uint32_t startFrame = plan[b].startFrame;
@@ -881,7 +922,12 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
             }
             fwrite(norm.data(), sizeof(float), samplesInBlock, cmprFile);
         }
+
+        printEncodeProgress(b + 1u);
     }
+
+    if (numberOfBlocks > 0)
+        printf("\n");
 
     if (cmprFile != nullptr)
         fclose(cmprFile);
