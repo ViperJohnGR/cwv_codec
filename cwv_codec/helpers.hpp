@@ -10,6 +10,7 @@ std::string getFilenameFromPath(const std::string& path);
 std::string getExtensionFromPath(const std::string& path);
 std::string removeExtensionFromPath(const std::string& path);
 std::string printBytes(std::uint64_t bytes);
+int openFile(FILE** f, const char* path, const char* mode);
 
 struct BitPack {
     std::vector<std::uint8_t> bytes; // packed bitstream (MSB-first per byte)

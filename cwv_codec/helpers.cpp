@@ -46,3 +46,13 @@ std::string printBytes(std::uint64_t bytes)
 
     return buffer;
 }
+
+int openFile(FILE** f, const char* path, const char *mode)
+{
+#if defined(_WIN32)
+    return fopen_s(f, path, mode);
+#else
+    *f = std::fopen(path, mode);
+    return (*f != nullptr) ? 0 : 1;
+#endif
+}

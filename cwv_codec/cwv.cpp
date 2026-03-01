@@ -250,16 +250,6 @@ struct BlockCandidate
     double distortion = 0.0;
 };
 
-int openBinaryWrite(FILE** f, const char* path)
-{
-#if defined(_WIN32)
-    return fopen_s(f, path, "wb");
-#else
-    *f = std::fopen(path, "wb");
-    return (*f != nullptr) ? 0 : 1;
-#endif
-}
-
 struct PlannedBlock
 {
     uint32_t startFrame = 0;
@@ -1122,7 +1112,7 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
 
     FILE* cmprFile = nullptr;
     if (saveCompressed)
-        openBinaryWrite(&cmprFile, "compressed");
+        openFile(&cmprFile, "compressed", "wb");
 
     std::vector<uint8_t> seed(channels, 0);
     std::vector<uint8_t> residual;

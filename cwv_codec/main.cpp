@@ -117,7 +117,7 @@ int main(int argc, char** argv)
             outputName += ".cwv";
 
             FILE* fp = nullptr;
-            fopen_s(&fp, outputName.c_str(), "wb");
+            openFile(&fp, outputName.c_str(), "wb");
             if (fp == NULL)
                 return printf("Error opening output file '%s'\n", outputName.c_str());
 
@@ -133,7 +133,7 @@ int main(int argc, char** argv)
         else
         {
             FILE* fp = nullptr;
-            fopen_s(&fp, argv[i], "rb");
+            openFile(&fp, argv[i], "rb");
             if (fp != NULL)
             {
                 fseek(fp, 0, SEEK_END);
