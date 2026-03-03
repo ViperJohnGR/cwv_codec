@@ -15,34 +15,26 @@
 //     u32     blockSize      (fixed block size in PCM frames)
 //     u32     numberOfBlocks
 //     u8      quantFlags
-//              - bit 7 = adaptive per-block quantization width present in packInfo
+//              - bit 7 = block-local quantization metadata present in packInfo
 //              - bits 6:0 = nominal quant bits (1..8)
 //
 //   Then for each block:
 //     u8      packInfo
-//              - non-adaptive files:
-//                  high nibble = predictor (0 = 1st-order, 1 = 2nd-order)
-//                  low  nibble = residual bit width for the block payload (0 = implicit zero residuals)
-//              - adaptive files:
-//                  high nibble bit 3    = predictor (0 = 1st-order, 1 = 2nd-order)
-//                  high nibble bits 2:0 = block quantBits - 1 (0..7 -> 1..8 bits)
-//                  low  nibble          = residual bit width for the block payload (0 = implicit zero residuals)
-//     u8      gainCode[channels]  (packed gain in dB, per-channel)
-//     u8      residualPeak        (maximum absolute predictor residual in quantized-code units)
-//     ...     seedSamples         (first-frame samples, packed with the block quant bits)
-//     ...     audioData           (bit-packed interleaved scaled-DPCM payload for the rest of the block)
+//              - high nibble = predictor (0 = none, 1 = 1st-order, 2 = 2nd-order)
+//              - low  nibble = block quant bits minus 1 (0..7 -> 1..8 bits)
+//     u16     residualPeakQ[channels]
+//              - block-local peak residual scale per channel, mapped to [0, 8]
+//     ...     audioData
+//              - bit-packed interleaved residual codes for every sample in the block
 //
 // Notes:
-// - This format revision is intentionally not backward compatible with the previous
-//   exact-delta / zigzag residual stream.
-// - Each block uses a per-channel gain, computed as the gain required to normalize
-//   the block peak for that channel.
-// - Adaptive files keep roughly the same bitrate by choosing a per-block quantization
-//   width near the requested nominal width.
-// - The first frame (one sample per channel) is stored as absolute values (seedSamples).
-// - The rest of the samples are stored as predictor residual buckets. For example,
-//   a 4-bit residual stream carries 16 scaled residual levels across that block's
-//   residualPeak range instead of exact +/- step deltas.
+// - This revision is intentionally not backward compatible with the previous
+//   gain-normalized seed/residual format.
+// - Stereo is coded as independent channels; no side/mid transform is used.
+// - Predictor state carries across block boundaries, which reduces block-edge
+//   discontinuities compared with restarting prediction every block.
+// - Residuals are encoded in the sample domain with companded quantization,
+//   which preserves low-level detail better than uniform block-normalized PCM.
 
 struct CWVHeader
 {
