@@ -45,8 +45,6 @@
 //   exact-delta / zigzag residual stream.
 // - Variable-size files keep block sizes out of the block payload; only size changes are
 //   stored in the header-side change table using frame deltas.
-// - In auto-block mode, the planner may inject transient-focused peak blocks inside a
-//   larger candidate region; those peak blocks are allowed to use arbitrary frame counts.
 // - Each block uses a per-channel gain, computed as the gain required to normalize
 //   the block peak for that channel.
 // - Adaptive files keep roughly the same bitrate by choosing a per-block quantization

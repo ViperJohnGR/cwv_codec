@@ -23,14 +23,6 @@ constexpr double kAutoBlockChangePenaltyBytes = 12.0;
 constexpr double kAutoBlockSizePreferencePenalty = 0.35;
 constexpr uint8_t kAutoBlockQualityMin = 0u;
 constexpr uint8_t kAutoBlockQualityMax = 10u;
-constexpr uint32_t kAutoBlockPeakSearchMinFrames = 24u;
-constexpr uint32_t kAutoBlockPeakBlockMinFrames = 4u;
-constexpr uint32_t kAutoBlockPeakBlockMaxFrames = 48u;
-constexpr uint32_t kAutoBlockPeakEdgeGuardFrames = 3u;
-constexpr double kAutoBlockPeakScoreRatio = 3.0;
-constexpr double kAutoBlockPeakAbsoluteThreshold = 0.08;
-constexpr double kAutoBlockPeakExtendRatio = 0.35;
-constexpr double kAutoBlockPeakBaselineBoost = 1.75;
 
 constexpr double kAutoBlockMinSizeLog2 = 3.0;  // log2(8)
 constexpr double kAutoBlockMaxSizeLog2 = 9.0;  // log2(512)
@@ -262,13 +254,6 @@ struct BlockSizeChange
     uint16_t newBlockSize = 0;
 };
 
-struct PeakIsolationDecision
-{
-    bool valid = false;
-    uint32_t prefixFrames = 0;
-    uint32_t peakFrames = 0;
-};
-
 void computeBlockGain(const audioStream& audio, uint64_t startSample, uint32_t framesInBlock, uint8_t channels,
     std::vector<float>& peak, std::vector<float>& gain, std::vector<uint8_t>& gainCode)
 {
@@ -401,152 +386,6 @@ BlockCandidate evaluateNominalBlock(const audioStream& audio, uint32_t startFram
     return bestCandidate;
 }
 
-
-PeakIsolationDecision findPeakIsolationDecision(const audioStream& audio, uint32_t startFrame, uint32_t framesInBlock)
-{
-    PeakIsolationDecision decision{};
-
-    const uint8_t channels = audio.channels;
-    if (channels == 0 || framesInBlock < kAutoBlockPeakSearchMinFrames)
-        return decision;
-
-    const uint32_t maxPeakFrames = std::min<uint32_t>(kAutoBlockPeakBlockMaxFrames, framesInBlock - 1u);
-    if (maxPeakFrames < kAutoBlockPeakBlockMinFrames)
-        return decision;
-
-    const uint64_t startSample = static_cast<uint64_t>(startFrame) * channels;
-    std::vector<float> peak(channels, 0.0f);
-    std::vector<float> gain(channels, 1.0f);
-    std::vector<uint8_t> gainCode(channels, 0u);
-    computeBlockGain(audio, startSample, framesInBlock, channels, peak, gain, gainCode);
-
-    std::vector<double> frameScore(framesInBlock, 0.0);
-    for (uint32_t f = 1; f < framesInBlock; ++f)
-    {
-        const uint64_t curBase = startSample + static_cast<uint64_t>(f) * channels;
-        const uint64_t prevBase = curBase - channels;
-        const uint64_t prev2Base = (f >= 2u) ? (prevBase - channels) : prevBase;
-
-        double score = 0.0;
-        for (uint8_t ch = 0; ch < channels; ++ch)
-        {
-            const double prev2 = static_cast<double>(audio.sampleData[prev2Base + ch]) * static_cast<double>(gain[ch]);
-            const double prev1 = static_cast<double>(audio.sampleData[prevBase + ch]) * static_cast<double>(gain[ch]);
-            const double cur = static_cast<double>(audio.sampleData[curBase + ch]) * static_cast<double>(gain[ch]);
-            const double slope = std::abs(cur - prev1);
-            const double residual = std::abs(cur - (2.0 * prev1 - prev2));
-            score = std::max(score, slope + residual);
-        }
-
-        frameScore[f] = score;
-    }
-
-    const uint32_t searchStart = std::max<uint32_t>(1u, kAutoBlockPeakEdgeGuardFrames);
-    const uint32_t searchEnd = (framesInBlock > kAutoBlockPeakEdgeGuardFrames)
-        ? (framesInBlock - kAutoBlockPeakEdgeGuardFrames)
-        : framesInBlock;
-
-    if (searchEnd <= searchStart)
-        return decision;
-
-    std::vector<double> sortedScores;
-    sortedScores.reserve(searchEnd - searchStart);
-    for (uint32_t f = searchStart; f < searchEnd; ++f)
-        sortedScores.push_back(frameScore[f]);
-
-    if (sortedScores.empty())
-        return decision;
-
-    auto medianIt = sortedScores.begin() + static_cast<std::ptrdiff_t>(sortedScores.size() / 2u);
-    std::nth_element(sortedScores.begin(), medianIt, sortedScores.end());
-    const double baseline = std::max(*medianIt, 1e-9);
-
-    uint32_t peakFrame = searchStart;
-    double peakScore = frameScore[peakFrame];
-    for (uint32_t f = searchStart + 1u; f < searchEnd; ++f)
-    {
-        if (frameScore[f] > peakScore)
-        {
-            peakScore = frameScore[f];
-            peakFrame = f;
-        }
-    }
-
-    if (peakScore < kAutoBlockPeakAbsoluteThreshold)
-        return decision;
-
-    if (peakScore < baseline * kAutoBlockPeakScoreRatio)
-        return decision;
-
-    const double extendThreshold = std::max(peakScore * kAutoBlockPeakExtendRatio,
-        baseline * kAutoBlockPeakBaselineBoost);
-
-    uint32_t peakStart = peakFrame;
-    uint32_t peakEnd = peakFrame;
-
-    while (peakStart > 1u && frameScore[peakStart - 1u] >= extendThreshold)
-        --peakStart;
-    while ((peakEnd + 1u) < framesInBlock && frameScore[peakEnd + 1u] >= extendThreshold)
-        ++peakEnd;
-
-    if (peakStart > 0u)
-        --peakStart;
-    if ((peakEnd + 1u) < framesInBlock)
-        ++peakEnd;
-
-    uint32_t peakFrames = peakEnd - peakStart + 1u;
-
-    while (peakFrames < kAutoBlockPeakBlockMinFrames)
-    {
-        bool grew = false;
-        if (peakStart > 0u)
-        {
-            --peakStart;
-            ++peakFrames;
-            grew = true;
-        }
-        if (peakFrames >= kAutoBlockPeakBlockMinFrames)
-            break;
-        if ((peakEnd + 1u) < framesInBlock)
-        {
-            ++peakEnd;
-            ++peakFrames;
-            grew = true;
-        }
-        if (!grew)
-            break;
-    }
-
-    while (peakFrames > maxPeakFrames)
-    {
-        const double trimLeftScore = (peakStart < peakFrame && (peakStart + 1u) < framesInBlock)
-            ? frameScore[peakStart + 1u]
-            : std::numeric_limits<double>::infinity();
-        const double trimRightScore = (peakEnd > peakFrame)
-            ? frameScore[peakEnd]
-            : std::numeric_limits<double>::infinity();
-
-        if (trimRightScore < trimLeftScore && peakEnd > peakFrame)
-            --peakEnd;
-        else if (peakStart < peakFrame)
-            ++peakStart;
-        else if (peakEnd > peakFrame)
-            --peakEnd;
-        else
-            break;
-
-        peakFrames = peakEnd - peakStart + 1u;
-    }
-
-    if (peakFrames >= framesInBlock)
-        return decision;
-
-    decision.valid = true;
-    decision.prefixFrames = peakStart;
-    decision.peakFrames = peakFrames;
-    return decision;
-}
-
 std::vector<PlannedBlock> buildFixedBlockPlan(uint64_t totalFrames, uint32_t blockSizeFrames)
 {
     std::vector<PlannedBlock> plan;
@@ -587,9 +426,6 @@ std::vector<PlannedBlock> buildAutoBlockPlan(const audioStream& audio, uint8_t b
 
     uint64_t startFrame = 0;
     uint32_t previousBlockSize = 0;
-    bool havePendingPeakBlock = false;
-    uint32_t pendingPeakBlockFrames = 0;
-    uint32_t isolatedPeakBlockCount = 0;
 
     uint32_t lastBlockAnalysisProgressPercent = std::numeric_limits<uint32_t>::max();
     auto printBlockAnalysisProgress = [&](uint64_t completedFrames)
@@ -615,22 +451,7 @@ std::vector<PlannedBlock> buildAutoBlockPlan(const audioStream& audio, uint8_t b
     {
         const uint64_t remaining = totalFrames - startFrame;
 
-        if (havePendingPeakBlock)
-        {
-            const uint32_t forcedFrames = static_cast<uint32_t>(std::min<uint64_t>(pendingPeakBlockFrames, remaining));
-            if (forcedFrames == 0)
-                break;
-
-            plan.push_back({ static_cast<uint32_t>(startFrame), forcedFrames });
-            startFrame += forcedFrames;
-            previousBlockSize = forcedFrames;
-            havePendingPeakBlock = false;
-            pendingPeakBlockFrames = 0;
-            ++isolatedPeakBlockCount;
-            printBlockAnalysisProgress(startFrame);
-            continue;
-        }
-
+        BlockCandidate bestCandidate{};
         double bestScore = std::numeric_limits<double>::infinity();
         uint32_t bestFrames = 0;
 
@@ -656,6 +477,7 @@ std::vector<PlannedBlock> buildAutoBlockPlan(const audioStream& audio, uint8_t b
             {
                 bestScore = score;
                 bestFrames = framesInBlock;
+                bestCandidate = candidate;
             }
         };
 
@@ -674,31 +496,6 @@ std::vector<PlannedBlock> buildAutoBlockPlan(const audioStream& audio, uint8_t b
         if (bestFrames == 0)
             break;
 
-        const PeakIsolationDecision peakDecision = findPeakIsolationDecision(audio, static_cast<uint32_t>(startFrame), bestFrames);
-        if (peakDecision.valid)
-        {
-            if (peakDecision.prefixFrames > 0)
-            {
-                plan.push_back({ static_cast<uint32_t>(startFrame), peakDecision.prefixFrames });
-                startFrame += peakDecision.prefixFrames;
-                previousBlockSize = peakDecision.prefixFrames;
-                havePendingPeakBlock = true;
-                pendingPeakBlockFrames = peakDecision.peakFrames;
-                printBlockAnalysisProgress(startFrame);
-                continue;
-            }
-
-            if (peakDecision.peakFrames > 0 && peakDecision.peakFrames < bestFrames)
-            {
-                plan.push_back({ static_cast<uint32_t>(startFrame), peakDecision.peakFrames });
-                startFrame += peakDecision.peakFrames;
-                previousBlockSize = peakDecision.peakFrames;
-                ++isolatedPeakBlockCount;
-                printBlockAnalysisProgress(startFrame);
-                continue;
-            }
-        }
-
         plan.push_back({ static_cast<uint32_t>(startFrame), bestFrames });
         startFrame += bestFrames;
         previousBlockSize = bestFrames;
@@ -707,9 +504,6 @@ std::vector<PlannedBlock> buildAutoBlockPlan(const audioStream& audio, uint8_t b
 
     if (lastBlockAnalysisProgressPercent != std::numeric_limits<uint32_t>::max())
         printf("\n");
-
-    if (isolatedPeakBlockCount > 0)
-        printf("Peak isolation inserted %u transient-focused blocks.\n", isolatedPeakBlockCount);
 
     return plan;
 }
