@@ -41,7 +41,7 @@ struct CWVHeader
     char magic[3]{};
     uint8_t channels = 0;
     uint32_t sampleRate = 0;
-    sf_count_t totalPCMFrameCount = 0;
+    int64_t totalPCMFrameCount = 0;
     uint32_t blockSize = 0; // fixed-size files only
     uint32_t numberOfBlocks = 0;
     uint8_t quantBits = 0;  // nominal quant bits only

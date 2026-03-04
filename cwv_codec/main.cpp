@@ -1,3 +1,5 @@
+#define DR_WAV_IMPLEMENTATION
+
 #include "audioStream.hpp"
 #include "cwv.hpp"
 #include "helpers.hpp"
@@ -15,16 +17,19 @@ int main(int argc, char** argv)
     if (argc < 2)
         return printf("Usage: %s input [-bits N] [-block FRAMES] [-lowpass HZ] [-normalize] [-gain FLOAT] [-sc]\n", getFilenameFromPath(argv[0]).c_str());
 
-    int bits = 6;
-    uint32_t blockSize = 64;
+    int bits = 4;
+    uint32_t blockSize = 128;
     float lowpassHz = 0.0f;
     float gain = 1.0f;
     bool expectbits = false;
     bool expectblock = false;
+    bool expectfilename = false;
     bool expectlowpass = false;
     bool expectgain = false;
     bool saveCompressed = false;
     bool normalize = false;
+
+    std::string outputFilename = "output.wav";
 
 
     for (int i = 1; i < argc; i++)
@@ -41,10 +46,12 @@ int main(int argc, char** argv)
             expectgain = true;
         else if (strcmp(argv[i], "-lowpass") == 0)
             expectlowpass = true;
+        else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "-output") == 0)
+            expectfilename = true;
         else if (expectbits)
         {
             bits = atoi(argv[i]);
-            expectbits = 0;
+            expectbits = false;
         }
         else if (expectblock)
         {
@@ -53,17 +60,22 @@ int main(int argc, char** argv)
                 return printf("Error: block size must be a positive integer number of frames.\n");
 
             blockSize = static_cast<uint32_t>(parsedBlockSize);
-            expectblock = 0;
+            expectblock = false;
+        }
+        else if (expectfilename)
+        {
+            outputFilename = getExtensionFromPath(argv[i]).empty() ? (argv[i] + std::string(".wav")) : argv[i];
+            expectfilename = false;
         }
         else if (expectlowpass)
         {
             lowpassHz = std::max(0.0f, static_cast<float>(atof(argv[i])));
-            expectlowpass = 0;
+            expectlowpass = false;
         }
         else if (expectgain)
         {
             gain = static_cast<float>(atof(argv[i]));
-            expectgain = 0;
+            expectgain = false;
         }
         else if (getExtensionFromPath(argv[i]) != "cwv")
         {
@@ -141,6 +153,7 @@ int main(int argc, char** argv)
                     if (decodeResult != 0)
                         return 1;
 
+#ifdef SNDFILE_HH
                     SNDFILE* outFile;
                     SF_INFO outFileInfo = { 0 };
 
@@ -149,16 +162,37 @@ int main(int argc, char** argv)
                     outFileInfo.samplerate = (int)hdr.sampleRate;
                     outFileInfo.format = SF_FORMAT_WAV | SF_FORMAT_FLOAT;
 
-                    outFile = sf_open("output.wav", SFM_WRITE, &outFileInfo);
+                    outFile = sf_open(outputFilename.c_str(), SFM_WRITE, &outFileInfo);
                     if (outFile == NULL)
                     {
-                        printf("Cannot open '%s'.\n%s\n", "output.wav", sf_strerror(NULL));
+                        printf("Cannot open '%s'.\n%s\n", outputFilename.c_str(), sf_strerror(NULL));
                         return 1;
                     }
                     sf_writef_float(outFile, &output[0], hdr.totalPCMFrameCount);
                     sf_close(outFile);
+#else
+                    drwav_data_format format{};
+                    format.container = drwav_container_riff;     // normal .wav
+                    format.format = DR_WAVE_FORMAT_IEEE_FLOAT;   // float WAV
+                    format.channels = hdr.channels;
+                    format.sampleRate = hdr.sampleRate;
+                    format.bitsPerSample = 32;
+
+                    const drwav_uint64 frameCount = static_cast<drwav_uint64>(output.size() / format.channels);
+
+                    drwav wav{};
+                    if (!drwav_init_file_write(&wav, outputFilename.c_str(), &format, nullptr))
+                        printf("Failed to open WAV for writing\n");
+
+                    const drwav_uint64 framesWritten = drwav_write_pcm_frames(&wav, frameCount, output.data());
+                    drwav_uninit(&wav);
+                    if (framesWritten != frameCount)
+                        printf("Failed to write all PCM frames\n");
+#endif
                 }
             }
+            else
+                printf("Error! Could not open file '%s'\n", argv[i]);
         }
 
     }

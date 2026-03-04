@@ -54,22 +54,21 @@ audioStream::audioStream()
 
 audioStream::audioStream(const std::string& path)
 {
+    sampleRate = 0;
+    channels = 0;
+    totalPCMFrameCount = 0;
+
+#ifdef SNDFILE_HH
     SF_INFO info{};
     SNDFILE* file = sf_open(path.c_str(), SFM_READ, &info);
     if (file == nullptr)
     {
-        channels = 0;
-        sampleRate = 0;
-        totalPCMFrameCount = 0;
         printf("Cannot open '%s'. %s\n", path.c_str(), sf_strerror(NULL));
         return;
     }
 
     if (info.channels < 1 || info.channels > 255)
     {
-        channels = 0;
-        sampleRate = 0;
-        totalPCMFrameCount = 0;
         printf("Error. Invalid number of channels (%d).\n", info.channels);
         return;
     }
@@ -81,6 +80,39 @@ audioStream::audioStream(const std::string& path)
     channels = static_cast<uint8_t>(info.channels);
     sampleRate = info.samplerate;
     totalPCMFrameCount = info.frames;
+#else
+    drwav wav{};
+    if (!drwav_init_file(&wav, path.c_str(), nullptr))
+    {
+        printf("Cannot open '%s'.\n", path.c_str());
+        return;
+    }
+
+    if (wav.channels < 1 || wav.channels > 255)
+    {
+        printf("Error. Invalid number of channels (%d).\n", wav.channels);
+        return;
+    }
+
+    sampleRate = wav.sampleRate;
+    channels = (uint8_t)wav.channels;
+    totalPCMFrameCount = wav.totalPCMFrameCount;
+
+    const drwav_uint64 totalSampleCount = totalPCMFrameCount * channels;
+
+    sampleData.resize(static_cast<size_t>(totalSampleCount));
+
+    const drwav_uint64 framesRead = drwav_read_pcm_frames_f32(&wav, wav.totalPCMFrameCount, &sampleData[0]);
+
+    drwav_uninit(&wav);
+
+    // Trim in case fewer frames were actually read.
+    if (framesRead * channels != totalSampleCount)
+    {
+        printf("framesRead(%llu) * channels(%u) != totalSampleCount(%llu)", framesRead, channels, totalSampleCount);
+        sampleData.resize(static_cast<size_t>(framesRead * channels));
+    }
+#endif
 }
 
 bool audioStream::normalize()

@@ -1,6 +1,9 @@
 #pragma once
 
 #include "sndfile.hh"
+#ifndef SNDFILE_HH
+    #include "dr_wav.h"
+#endif
 #include <string>
 #include <vector>
 
@@ -9,7 +12,7 @@ struct audioStream
 {
     uint8_t channels;
     int sampleRate;
-    sf_count_t totalPCMFrameCount;
+    int64_t totalPCMFrameCount;
     std::vector<float> sampleData;
 
 public:

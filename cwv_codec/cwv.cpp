@@ -381,7 +381,7 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
     out.insert(out.end(), { 'C', 'W', 'V' });
     appendLE(out, audio.channels);
     appendLE(out, static_cast<uint32_t>(audio.sampleRate));
-    appendLE(out, static_cast<sf_count_t>(audio.totalPCMFrameCount));
+    appendLE(out, static_cast<int64_t>(audio.totalPCMFrameCount));
     appendLE(out, static_cast<uint32_t>(blockSizeFrames));
     appendLE(out, static_cast<uint32_t>(numberOfBlocks));
 
