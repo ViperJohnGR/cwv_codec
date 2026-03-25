@@ -1,5 +1,11 @@
 #include "audioStream.hpp"
 
+#ifdef _WIN32
+    #include "sndfile.hh"
+#else
+    #include "dr_wav.h"
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>

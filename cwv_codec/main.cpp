@@ -4,194 +4,424 @@
 #include "cwv.hpp"
 #include "helpers.hpp"
 
+#ifdef _WIN32
+    #include "sndfile.hh"
+#else
+    #include "dr_wav.h"
+#endif
+
 #include <algorithm>
 #include <chrono>
+#include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
-int main(int argc, char** argv)
-{
-    if (argc < 2)
-        return printf("Usage: %s input [-bits N] [-block FRAMES] [-lowpass HZ] [-normalize] [-gain FLOAT]\n", getFilenameFromPath(argv[0]).c_str());
+namespace {
 
+struct ProgramOptions
+{
     int bits = 4;
     uint32_t blockSize = 128;
     float lowpassHz = 0.0f;
     float gain = 1.0f;
-    bool expectbits = false;
-    bool expectblock = false;
-    bool expectfilename = false;
-    bool expectlowpass = false;
-    bool expectgain = false;
     bool normalize = false;
+    std::string outputFilename;
+    std::vector<std::string> inputs;
+};
 
-    std::string outputFilename = "output.wav";
+bool stringsEqualIgnoreCase(const std::string& a, const std::string& b)
+{
+    if (a.size() != b.size())
+        return false;
 
-
-    for (int i = 1; i < argc; i++)
+    for (size_t i = 0; i < a.size(); ++i)
     {
-        if (strcmp(argv[i], "-bits") == 0)
-            expectbits = true;
-        else if (strcmp(argv[i], "-block") == 0)
-            expectblock = true;
-        else if (strcmp(argv[i], "-normalize") == 0)
-            normalize = true;
-        else if (strcmp(argv[i], "-gain") == 0)
-            expectgain = true;
-        else if (strcmp(argv[i], "-lowpass") == 0)
-            expectlowpass = true;
-        else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "-output") == 0)
-            expectfilename = true;
-        else if (expectbits)
+        if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i])))
+            return false;
+    }
+
+    return true;
+}
+
+bool isCWVPath(const std::string& path)
+{
+    return stringsEqualIgnoreCase(getExtensionFromPath(path), "cwv");
+}
+
+bool parseIntArgument(const char* value, const char* optionName, int minValue, int maxValue, int& out)
+{
+    if (value == nullptr || value[0] == '\0')
+    {
+        printf("Error: %s requires a value.\n", optionName);
+        return false;
+    }
+
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0')
+    {
+        printf("Error: %s expects an integer value.\n", optionName);
+        return false;
+    }
+    if (parsed < minValue || parsed > maxValue)
+    {
+        printf("Error: %s must be in [%d, %d].\n", optionName, minValue, maxValue);
+        return false;
+    }
+
+    out = static_cast<int>(parsed);
+    return true;
+}
+
+bool parseFloatArgument(const char* value, const char* optionName, float minValue, float maxValue, float& out)
+{
+    if (value == nullptr || value[0] == '\0')
+    {
+        printf("Error: %s requires a value.\n", optionName);
+        return false;
+    }
+
+    char* end = nullptr;
+    errno = 0;
+    const float parsed = std::strtof(value, &end);
+    if (errno != 0 || end == value || *end != '\0')
+    {
+        printf("Error: %s expects a numeric value.\n", optionName);
+        return false;
+    }
+    if (parsed < minValue || parsed > maxValue)
+    {
+        printf("Error: %s must be in [%.3f, %.3f].\n", optionName, minValue, maxValue);
+        return false;
+    }
+
+    out = parsed;
+    return true;
+}
+
+bool parseCommandLine(int argc, char** argv, ProgramOptions& options)
+{
+    for (int i = 1; i < argc; ++i)
+    {
+        const char* arg = argv[i];
+
+        if (std::strcmp(arg, "-bits") == 0)
         {
-            bits = atoi(argv[i]);
-            expectbits = false;
+            if (i + 1 >= argc)
+            {
+                printf("Error: -bits requires a value.\n");
+                return false;
+            }
+
+            int parsedBits = 0;
+            if (!parseIntArgument(argv[++i], "-bits", 1, 8, parsedBits))
+                return false;
+            options.bits = parsedBits;
         }
-        else if (expectblock)
+        else if (std::strcmp(arg, "-block") == 0)
         {
-            const int parsedBlockSize = atoi(argv[i]);
-            if (parsedBlockSize <= 0)
-                return printf("Error: block size must be a positive integer number of frames.\n");
+            if (i + 1 >= argc)
+            {
+                printf("Error: -block requires a value.\n");
+                return false;
+            }
 
-            blockSize = static_cast<uint32_t>(parsedBlockSize);
-            expectblock = false;
+            int parsedBlockSize = 0;
+            if (!parseIntArgument(argv[++i], "-block", 1, std::numeric_limits<int>::max(), parsedBlockSize))
+                return false;
+            options.blockSize = static_cast<uint32_t>(parsedBlockSize);
         }
-        else if (expectfilename)
+        else if (std::strcmp(arg, "-lowpass") == 0)
         {
-            outputFilename = getExtensionFromPath(argv[i]).empty() ? (argv[i] + std::string(".wav")) : argv[i];
-            expectfilename = false;
+            if (i + 1 >= argc)
+            {
+                printf("Error: -lowpass requires a value.\n");
+                return false;
+            }
+
+            if (!parseFloatArgument(argv[++i], "-lowpass", 0.0f, std::numeric_limits<float>::max(), options.lowpassHz))
+                return false;
         }
-        else if (expectlowpass)
+        else if (std::strcmp(arg, "-gain") == 0)
         {
-            lowpassHz = std::max(0.0f, static_cast<float>(atof(argv[i])));
-            expectlowpass = false;
+            if (i + 1 >= argc)
+            {
+                printf("Error: -gain requires a value.\n");
+                return false;
+            }
+
+            if (!parseFloatArgument(argv[++i], "-gain", -std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), options.gain))
+                return false;
         }
-        else if (expectgain)
+        else if (std::strcmp(arg, "-normalize") == 0)
         {
-            gain = static_cast<float>(atof(argv[i]));
-            expectgain = false;
+            options.normalize = true;
         }
-        else if (getExtensionFromPath(argv[i]) != "cwv")
+        else if (std::strcmp(arg, "-o") == 0 || std::strcmp(arg, "-output") == 0)
         {
-            printf("Reading input...\n");
-            printf("bitsPerSample = %d\n", bits);
-            printf("blockSize (frames) = %u\n", blockSize);
-            if (lowpassHz > 0.0f)
-                printf("lowpass = %.2f Hz\n", lowpassHz);
-            if (normalize)
-                printf("normalize = on\n");
-            if (gain != 1.0f)
-                printf("gain = %.6f\n", gain);
+            if (i + 1 >= argc)
+            {
+                printf("Error: %s requires a filename.\n", arg);
+                return false;
+            }
 
-            audioStream inStream(argv[i]);
-            if (inStream.channels < 1)
-                return printf("Error! inStream.channels is %d\n", inStream.channels);
-
-            if (lowpassHz > 0.0f && !inStream.applyLowPass(lowpassHz))
-                printf("Failed to apply lowpass at %.2f Hz.\n", lowpassHz);
-
-            if (normalize && !inStream.normalize())
-                printf("Failed to apply normalization.\n");
-
-            if (gain != 1.0f && !inStream.applyGain(gain))
-                printf("Failed to apply gain %.6f\n", gain);
-
-            printf("Starting encoder...\n");
-            const auto encodeStart = std::chrono::steady_clock::now();
-            std::vector<uint8_t> outBuf = encodeCWV(inStream, blockSize, static_cast<uint8_t>(bits));
-            const auto encodeEnd = std::chrono::steady_clock::now();
-            const auto encodeMs = std::chrono::duration_cast<std::chrono::milliseconds>(encodeEnd - encodeStart);
-            printf("Encoder time: %lld ms (%.3f s)\n", static_cast<long long>(encodeMs.count()), std::chrono::duration<double>(encodeEnd - encodeStart).count());
-            if (outBuf.empty())
-                return 1;
-
-            std::string outputName = removeExtensionFromPath(argv[i]);
-            outputName += ".cwv";
-
-            FILE* fp = nullptr;
-            openFile(&fp, outputName.c_str(), "wb");
-            if (fp == NULL)
-                return printf("Error opening output file '%s'\n", outputName.c_str());
-
-            printf("Writing '%s'...\n", outputName.c_str());
-            const size_t wrote = fwrite(outBuf.data(), 1, outBuf.size(), fp);
-            fclose(fp);
-
-            if (wrote != outBuf.size())
-                return printf("Error! wrote %llu of %llu bytes\n", (unsigned long long)wrote, (unsigned long long)outBuf.size());
-
-            printf("Wrote %s\n", printBytes(wrote).c_str());
+            options.outputFilename = argv[++i];
+            if (options.outputFilename.empty())
+            {
+                printf("Error: %s requires a non-empty filename.\n", arg);
+                return false;
+            }
+        }
+        else if (std::strcmp(arg, "-h") == 0 || std::strcmp(arg, "--help") == 0)
+        {
+            return false;
+        }
+        else if (arg[0] == '-')
+        {
+            printf("Error: unknown option '%s'.\n", arg);
+            return false;
         }
         else
         {
-            FILE* fp = nullptr;
-            openFile(&fp, argv[i], "rb");
-            if (fp != NULL)
-            {
-                fseek(fp, 0, SEEK_END);
-                unsigned long filesize = ftell(fp);
-                fseek(fp, 0, SEEK_SET);
-                std::vector<uint8_t> inBuf(filesize, 0);
-                if (fread(&inBuf[0], 1, filesize, fp) == filesize)
-                {
-                    std::vector<float> output;
+            options.inputs.emplace_back(arg);
+        }
+    }
 
-                    CWVHeader hdr{};
-                    const auto decodeStart = std::chrono::steady_clock::now();
-                    const int decodeResult = decodeCWV(inBuf, output, &hdr);
-                    const auto decodeEnd = std::chrono::steady_clock::now();
-                    const auto decodeMs = std::chrono::duration_cast<std::chrono::milliseconds>(decodeEnd - decodeStart);
-                    printf("Decoder time: %lld ms (%.3f s)\n",
-                        static_cast<long long>(decodeMs.count()),
-                        std::chrono::duration<double>(decodeEnd - decodeStart).count());
-                    if (decodeResult != 0)
-                        return 1;
+    if (options.inputs.empty())
+    {
+        printf("Error: no input files were provided.\n");
+        return false;
+    }
+
+    if (!options.outputFilename.empty() && options.inputs.size() > 1)
+    {
+        printf("Error: -o can only be used when encoding or decoding a single input file.\n");
+        return false;
+    }
+
+    return true;
+}
+
+std::string makeOutputPath(const std::string& inputPath, const ProgramOptions& options)
+{
+    if (!options.outputFilename.empty())
+    {
+        if (!getExtensionFromPath(options.outputFilename).empty())
+            return options.outputFilename;
+
+        return options.outputFilename + (isCWVPath(inputPath) ? ".wav" : ".cwv");
+    }
+
+    std::string outputPath = removeExtensionFromPath(inputPath);
+    outputPath += isCWVPath(inputPath) ? ".wav" : ".cwv";
+    return outputPath;
+}
+
+int encodeInput(const std::string& inputPath, const std::string& outputPath, const ProgramOptions& options)
+{
+    printf("Reading input...\n");
+    printf("bitsPerSample = %d\n", options.bits);
+    printf("blockSize (frames) = %u\n", options.blockSize);
+    if (options.lowpassHz > 0.0f)
+        printf("lowpass = %.2f Hz\n", options.lowpassHz);
+    if (options.normalize)
+        printf("normalize = on\n");
+    if (options.gain != 1.0f)
+        printf("gain = %.6f\n", options.gain);
+
+    audioStream inStream(inputPath);
+    if (inStream.channels < 1)
+        return printf("Error! inStream.channels is %d\n", inStream.channels);
+
+    if (options.lowpassHz > 0.0f && !inStream.applyLowPass(options.lowpassHz))
+        printf("Failed to apply lowpass at %.2f Hz.\n", options.lowpassHz);
+
+    if (options.normalize && !inStream.normalize())
+        printf("Failed to apply normalization.\n");
+
+    if (options.gain != 1.0f && !inStream.applyGain(options.gain))
+        printf("Failed to apply gain %.6f\n", options.gain);
+
+    printf("Starting encoder...\n");
+    const auto encodeStart = std::chrono::steady_clock::now();
+    std::vector<uint8_t> outBuf = encodeCWV(inStream, options.blockSize, static_cast<uint8_t>(options.bits));
+    const auto encodeEnd = std::chrono::steady_clock::now();
+    const auto encodeMs = std::chrono::duration_cast<std::chrono::milliseconds>(encodeEnd - encodeStart);
+    printf("Encoder time: %lld ms (%.3f s)\n", static_cast<long long>(encodeMs.count()), std::chrono::duration<double>(encodeEnd - encodeStart).count());
+    if (outBuf.empty())
+        return 1;
+
+    FILE* fp = nullptr;
+    openFile(&fp, outputPath.c_str(), "wb");
+    if (fp == nullptr)
+        return printf("Error opening output file '%s'\n", outputPath.c_str());
+
+    printf("Writing '%s'...\n", outputPath.c_str());
+    const size_t wrote = fwrite(outBuf.data(), 1, outBuf.size(), fp);
+    fclose(fp);
+
+    if (wrote != outBuf.size())
+        return printf("Error! wrote %llu of %llu bytes\n", (unsigned long long)wrote, (unsigned long long)outBuf.size());
+
+    printf("Wrote %s\n", printBytes(wrote).c_str());
+    return 0;
+}
+
+bool readFileToBuffer(const std::string& inputPath, std::vector<uint8_t>& buffer)
+{
+    FILE* fp = nullptr;
+    openFile(&fp, inputPath.c_str(), "rb");
+    if (fp == nullptr)
+    {
+        printf("Error! Could not open file '%s'\n", inputPath.c_str());
+        return false;
+    }
+
+    if (std::fseek(fp, 0, SEEK_END) != 0)
+    {
+        fclose(fp);
+        printf("Error! Could not seek file '%s'\n", inputPath.c_str());
+        return false;
+    }
+
+    const long fileSizeLong = std::ftell(fp);
+    if (fileSizeLong < 0)
+    {
+        fclose(fp);
+        printf("Error! Could not determine file size for '%s'\n", inputPath.c_str());
+        return false;
+    }
+
+    if (std::fseek(fp, 0, SEEK_SET) != 0)
+    {
+        fclose(fp);
+        printf("Error! Could not rewind file '%s'\n", inputPath.c_str());
+        return false;
+    }
+
+    const size_t fileSize = static_cast<size_t>(fileSizeLong);
+    buffer.assign(fileSize, 0u);
+
+    if (fileSize > 0)
+    {
+        const size_t bytesRead = std::fread(buffer.data(), 1, fileSize, fp);
+        fclose(fp);
+        if (bytesRead != fileSize)
+        {
+            printf("Error! Read %zu of %zu bytes from '%s'\n", bytesRead, fileSize, inputPath.c_str());
+            return false;
+        }
+    }
+    else
+    {
+        fclose(fp);
+    }
+
+    return true;
+}
+
+int decodeInput(const std::string& inputPath, const std::string& outputPath)
+{
+    std::vector<uint8_t> inBuf;
+    if (!readFileToBuffer(inputPath, inBuf))
+        return 1;
+
+    std::vector<float> output;
+    CWVHeader hdr{};
+    const auto decodeStart = std::chrono::steady_clock::now();
+    const int decodeResult = decodeCWV(inBuf, output, &hdr);
+    const auto decodeEnd = std::chrono::steady_clock::now();
+    const auto decodeMs = std::chrono::duration_cast<std::chrono::milliseconds>(decodeEnd - decodeStart);
+    printf("Decoder time: %lld ms (%.3f s)\n",
+        static_cast<long long>(decodeMs.count()),
+        std::chrono::duration<double>(decodeEnd - decodeStart).count());
+    if (decodeResult != 0)
+        return 1;
 
 #ifdef SNDFILE_HH
-                    SNDFILE* outFile;
-                    SF_INFO outFileInfo = { 0 };
+    SNDFILE* outFile;
+    SF_INFO outFileInfo = { 0 };
 
-                    outFileInfo.channels = hdr.channels;
-                    outFileInfo.frames = hdr.totalPCMFrameCount;
-                    outFileInfo.samplerate = (int)hdr.sampleRate;
-                    outFileInfo.format = SF_FORMAT_WAV | SF_FORMAT_FLOAT;
+    outFileInfo.channels = hdr.channels;
+    outFileInfo.frames = hdr.totalPCMFrameCount;
+    outFileInfo.samplerate = static_cast<int>(hdr.sampleRate);
+    outFileInfo.format = SF_FORMAT_WAV | SF_FORMAT_FLOAT;
 
-                    outFile = sf_open(outputFilename.c_str(), SFM_WRITE, &outFileInfo);
-                    if (outFile == NULL)
-                    {
-                        printf("Cannot open '%s'.\n%s\n", outputFilename.c_str(), sf_strerror(NULL));
-                        return 1;
-                    }
-                    sf_writef_float(outFile, &output[0], hdr.totalPCMFrameCount);
-                    sf_close(outFile);
+    outFile = sf_open(outputPath.c_str(), SFM_WRITE, &outFileInfo);
+    if (outFile == nullptr)
+    {
+        printf("Cannot open '%s'.\n%s\n", outputPath.c_str(), sf_strerror(nullptr));
+        return 1;
+    }
+    sf_writef_float(outFile, output.data(), hdr.totalPCMFrameCount);
+    sf_close(outFile);
 #else
-                    drwav_data_format format{};
-                    format.container = drwav_container_riff;     // normal .wav
-                    format.format = DR_WAVE_FORMAT_IEEE_FLOAT;   // float WAV
-                    format.channels = hdr.channels;
-                    format.sampleRate = hdr.sampleRate;
-                    format.bitsPerSample = 32;
+    drwav_data_format format{};
+    format.container = drwav_container_riff;
+    format.format = DR_WAVE_FORMAT_IEEE_FLOAT;
+    format.channels = hdr.channels;
+    format.sampleRate = hdr.sampleRate;
+    format.bitsPerSample = 32;
 
-                    const drwav_uint64 frameCount = static_cast<drwav_uint64>(output.size() / format.channels);
+    const drwav_uint64 frameCount = static_cast<drwav_uint64>(output.size() / format.channels);
 
-                    drwav wav{};
-                    if (!drwav_init_file_write(&wav, outputFilename.c_str(), &format, nullptr))
-                        printf("Failed to open WAV for writing\n");
+    drwav wav{};
+    if (!drwav_init_file_write(&wav, outputPath.c_str(), &format, nullptr))
+    {
+        printf("Failed to open WAV for writing\n");
+        return 1;
+    }
 
-                    const drwav_uint64 framesWritten = drwav_write_pcm_frames(&wav, frameCount, output.data());
-                    drwav_uninit(&wav);
-                    if (framesWritten != frameCount)
-                        printf("Failed to write all PCM frames\n");
+    const drwav_uint64 framesWritten = drwav_write_pcm_frames(&wav, frameCount, output.data());
+    drwav_uninit(&wav);
+    if (framesWritten != frameCount)
+    {
+        printf("Failed to write all PCM frames\n");
+        return 1;
+    }
 #endif
-                }
-            }
-            else
-                printf("Error! Could not open file '%s'\n", argv[i]);
-        }
 
+    printf("Wrote %s\n", outputPath.c_str());
+    return 0;
+}
+
+void printUsage(const char* argv0)
+{
+    printf("Usage: %s input [-bits N] [-block FRAMES] [-lowpass HZ] [-normalize] [-gain FLOAT] [-o OUTPUT]\n",
+        getFilenameFromPath(argv0).c_str());
+}
+
+} // namespace
+
+int main(int argc, char** argv)
+{
+    if (argc < 2)
+    {
+        printUsage(argv[0]);
+        return 1;
+    }
+
+    ProgramOptions options;
+    if (!parseCommandLine(argc, argv, options))
+    {
+        printUsage(argv[0]);
+        return 1;
+    }
+
+    for (const std::string& inputPath : options.inputs)
+    {
+        const std::string outputPath = makeOutputPath(inputPath, options);
+        const int result = isCWVPath(inputPath)
+            ? decodeInput(inputPath, outputPath)
+            : encodeInput(inputPath, outputPath, options);
+        if (result != 0)
+            return result;
     }
 
     return 0;

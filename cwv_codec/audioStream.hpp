@@ -1,13 +1,8 @@
 #pragma once
 
-#ifdef _WIN32
-    #include "sndfile.hh"
-#else
-    #include "dr_wav.h"
-#endif
+#include <cstdint>
 #include <string>
 #include <vector>
-
 
 struct audioStream
 {

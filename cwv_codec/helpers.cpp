@@ -1,4 +1,6 @@
-#include "helpers.hpp" 
+#include "helpers.hpp"
+
+#include <cstdio>
 
 
 std::string getFilenameFromPath(const std::string& path)

@@ -2,6 +2,7 @@
 
 #include "audioStream.hpp"
 
+#include <cstdint>
 #include <vector>
 
 // CWV block-based format (CWV)
@@ -19,7 +20,12 @@
 //
 //   Then for each block:
 //     u8      packInfo
-//              - high nibble = predictor (0 = none, 1 = 1st-order, 2 = 2nd-order)
+//              - high nibble = predictor
+//                  0 = none
+//                  1 = 1st-order
+//                  2 = 2nd-order extrapolation
+//                  3 = weighted 2-tap
+//                  4 = 3rd-order extrapolation
 //              - low  nibble = reserved and written as 0
 //     u16     residualPeakQ[channels]
 //              - block-local peak residual scale per channel, mapped to [0, 8]

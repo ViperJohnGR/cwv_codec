@@ -31,6 +31,7 @@ struct BlockCandidate
     double distortion = 0.0;
     std::vector<float> endPrev1;
     std::vector<float> endPrev2;
+    std::vector<float> endPrev3;
 };
 
 template <class T>
@@ -94,7 +95,7 @@ struct PackedBitReader
     }
 };
 
-float predictSample(uint8_t predictor, float prev1, float prev2)
+float predictSample(uint8_t predictor, float prev1, float prev2, float prev3)
 {
     switch (predictor)
     {
@@ -104,6 +105,10 @@ float predictSample(uint8_t predictor, float prev1, float prev2)
         return prev1;
     case 2:
         return std::clamp(2.0f * prev1 - prev2, -kResidualPeakRange, kResidualPeakRange);
+    case 3:
+        return std::clamp(1.5f * prev1 - 0.5f * prev2, -kResidualPeakRange, kResidualPeakRange);
+    case 4:
+        return std::clamp(3.0f * prev1 - 3.0f * prev2 + prev3, -kResidualPeakRange, kResidualPeakRange);
     default:
         return 0.0f;
     }
@@ -196,7 +201,8 @@ BlockCandidate evaluateBlockCandidate(const audioStream& audio,
     uint8_t quantBits,
     uint8_t predictor,
     const std::vector<float>& startPrev1,
-    const std::vector<float>& startPrev2)
+    const std::vector<float>& startPrev2,
+    const std::vector<float>& startPrev3)
 {
     BlockCandidate candidate{};
     candidate.predictor = predictor;
@@ -204,9 +210,11 @@ BlockCandidate evaluateBlockCandidate(const audioStream& audio,
     candidate.peakQ.assign(audio.channels, 0u);
     candidate.endPrev1 = startPrev1;
     candidate.endPrev2 = startPrev2;
+    candidate.endPrev3 = startPrev3;
 
     std::vector<float> analysisPrev1 = startPrev1;
     std::vector<float> analysisPrev2 = startPrev2;
+    std::vector<float> analysisPrev3 = startPrev3;
     std::vector<float> residualPeak(audio.channels, 0.0f);
 
     const uint64_t startSample = static_cast<uint64_t>(startFrame) * audio.channels;
@@ -216,8 +224,9 @@ BlockCandidate evaluateBlockCandidate(const audioStream& audio,
         for (uint8_t ch = 0; ch < audio.channels; ++ch)
         {
             const float sample = std::clamp(audio.sampleData[base + ch], -kSampleClamp, kSampleClamp);
-            const float pred = predictSample(predictor, analysisPrev1[ch], analysisPrev2[ch]);
+            const float pred = predictSample(predictor, analysisPrev1[ch], analysisPrev2[ch], analysisPrev3[ch]);
             residualPeak[ch] = std::max(residualPeak[ch], std::fabs(sample - pred));
+            analysisPrev3[ch] = analysisPrev2[ch];
             analysisPrev2[ch] = analysisPrev1[ch];
             analysisPrev1[ch] = sample;
         }
@@ -232,6 +241,7 @@ BlockCandidate evaluateBlockCandidate(const audioStream& audio,
 
     std::vector<float> reconPrev1 = startPrev1;
     std::vector<float> reconPrev2 = startPrev2;
+    std::vector<float> reconPrev3 = startPrev3;
     candidate.distortion = 0.0;
 
     for (uint32_t f = 0; f < framesInBlock; ++f)
@@ -240,12 +250,13 @@ BlockCandidate evaluateBlockCandidate(const audioStream& audio,
         for (uint8_t ch = 0; ch < audio.channels; ++ch)
         {
             const float inputSample = std::clamp(audio.sampleData[base + ch], -kSampleClamp, kSampleClamp);
-            const float pred = predictSample(predictor, reconPrev1[ch], reconPrev2[ch]);
+            const float pred = predictSample(predictor, reconPrev1[ch], reconPrev2[ch], reconPrev3[ch]);
             const uint8_t code = encodeResidualCode(inputSample - pred, quantBits, decodedPeak[ch]);
             const float reconResidual = decodeResidualCode(code, quantBits, decodedPeak[ch]);
             const float reconstructed = std::clamp(pred + reconResidual, -kSampleClamp, kSampleClamp);
             const double err = static_cast<double>(reconstructed) - static_cast<double>(inputSample);
             candidate.distortion += err * err;
+            reconPrev3[ch] = reconPrev2[ch];
             reconPrev2[ch] = reconPrev1[ch];
             reconPrev1[ch] = reconstructed;
         }
@@ -253,6 +264,7 @@ BlockCandidate evaluateBlockCandidate(const audioStream& audio,
 
     candidate.endPrev1 = std::move(reconPrev1);
     candidate.endPrev2 = std::move(reconPrev2);
+    candidate.endPrev3 = std::move(reconPrev3);
     return candidate;
 }
 
@@ -264,6 +276,7 @@ void encodeBlockPayload(const audioStream& audio,
     const std::vector<uint16_t>& peakQ,
     std::vector<float>& statePrev1,
     std::vector<float>& statePrev2,
+    std::vector<float>& statePrev3,
     std::vector<uint8_t>& codes)
 {
     const uint32_t samplesInBlock = framesInBlock * audio.channels;
@@ -282,13 +295,14 @@ void encodeBlockPayload(const audioStream& audio,
         for (uint8_t ch = 0; ch < audio.channels; ++ch)
         {
             const float inputSample = std::clamp(audio.sampleData[base + ch], -kSampleClamp, kSampleClamp);
-            const float pred = predictSample(predictor, statePrev1[ch], statePrev2[ch]);
+            const float pred = predictSample(predictor, statePrev1[ch], statePrev2[ch], statePrev3[ch]);
             const uint8_t code = encodeResidualCode(inputSample - pred, quantBits, decodedPeak[ch]);
             const float reconResidual = decodeResidualCode(code, quantBits, decodedPeak[ch]);
             const float outputSample = std::clamp(pred + reconResidual, -kSampleClamp, kSampleClamp);
 
             codes.push_back(code);
 
+            statePrev3[ch] = statePrev2[ch];
             statePrev2[ch] = statePrev1[ch];
             statePrev1[ch] = outputSample;
         }
@@ -331,6 +345,7 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
     std::vector<BlockCandidate> selected(numberOfBlocks);
     std::vector<float> runningPrev1(channels, 0.0f);
     std::vector<float> runningPrev2(channels, 0.0f);
+    std::vector<float> runningPrev3(channels, 0.0f);
 
     unsigned lastPercent = 101;
     for (uint32_t b = 0; b < numberOfBlocks; ++b)
@@ -346,10 +361,10 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
         const uint32_t startFrame = plan[b].startFrame;
         const uint32_t framesInBlock = plan[b].frames;
 
-        BlockCandidate best = evaluateBlockCandidate(audio, startFrame, framesInBlock, bitsPerSample, 0u, runningPrev1, runningPrev2);
-        for (uint8_t predictor = 1; predictor <= 2; ++predictor)
+        BlockCandidate best = evaluateBlockCandidate(audio, startFrame, framesInBlock, bitsPerSample, 0u, runningPrev1, runningPrev2, runningPrev3);
+        for (uint8_t predictor = 1; predictor <= 4; ++predictor)
         {
-            const BlockCandidate candidate = evaluateBlockCandidate(audio, startFrame, framesInBlock, bitsPerSample, predictor, runningPrev1, runningPrev2);
+            const BlockCandidate candidate = evaluateBlockCandidate(audio, startFrame, framesInBlock, bitsPerSample, predictor, runningPrev1, runningPrev2, runningPrev3);
             if (candidate.distortion < best.distortion)
                 best = candidate;
         }
@@ -357,6 +372,7 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
         selected[b] = best;
         runningPrev1 = best.endPrev1;
         runningPrev2 = best.endPrev2;
+        runningPrev3 = best.endPrev3;
     }
     printf("\n");
 
@@ -380,6 +396,7 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
     std::vector<float> debugReconstructed;
     runningPrev1.assign(channels, 0.0f);
     runningPrev2.assign(channels, 0.0f);
+    runningPrev3.assign(channels, 0.0f);
 
     printf("Encoding %u blocks...\n", numberOfBlocks);
     uint32_t lastEncodeProgressPercent = std::numeric_limits<uint32_t>::max();
@@ -413,6 +430,7 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
             choice.peakQ,
             runningPrev1,
             runningPrev2,
+            runningPrev3,
             codes);
 
         const BitPack packed = packBitsFixed<uint8_t>(codes, choice.quantBits);
@@ -484,6 +502,7 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
 
     std::vector<float> prev1(hdr.channels, 0.0f);
     std::vector<float> prev2(hdr.channels, 0.0f);
+    std::vector<float> prev3(hdr.channels, 0.0f);
     std::vector<float> residualPeak(hdr.channels, 0.0f);
 
     for (uint32_t b = 0; b < hdr.numberOfBlocks; ++b)
@@ -501,7 +520,7 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
         const uint8_t predictor = static_cast<uint8_t>(packInfo >> 4);
         const uint8_t blockQuantBits = hdr.quantBits;
 
-        if (predictor > 2)
+        if (predictor > 4)
         {
             printf("Error! Invalid predictor type (%u).\n", predictor);
             return 1;
@@ -546,10 +565,11 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
                     return 1;
                 }
 
-                const float pred = predictSample(predictor, prev1[ch], prev2[ch]);
+                const float pred = predictSample(predictor, prev1[ch], prev2[ch], prev3[ch]);
                 const float residual = decodeResidualCode(code, blockQuantBits, residualPeak[ch]);
                 const float sample = std::clamp(pred + residual, -kSampleClamp, kSampleClamp);
                 outputBuffer[static_cast<size_t>(outBase + ch)] = sample;
+                prev3[ch] = prev2[ch];
                 prev2[ch] = prev1[ch];
                 prev1[ch] = sample;
             }
