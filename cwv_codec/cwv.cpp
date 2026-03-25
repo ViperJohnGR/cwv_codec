@@ -2,6 +2,7 @@
 #include "helpers.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -173,6 +174,93 @@ float decodeResidualCode(uint8_t code, uint8_t quantBits, float residualPeak)
 
     const float companded = (static_cast<float>(code) * 2.0f / static_cast<float>(maxCode)) - 1.0f;
     return expandMuLaw(companded) * residualPeak;
+}
+
+const std::array<std::array<float, 256>, 9>& getResidualDecodeLut()
+{
+    static const std::array<std::array<float, 256>, 9> lut = []
+    {
+        std::array<std::array<float, 256>, 9> table{};
+        for (uint8_t quantBits = 1; quantBits <= 8; ++quantBits)
+        {
+            const uint32_t maxCode = (1u << quantBits) - 1u;
+            for (uint32_t code = 0; code <= maxCode; ++code)
+            {
+                const float companded = (static_cast<float>(code) * 2.0f / static_cast<float>(maxCode)) - 1.0f;
+                table[quantBits][code] = expandMuLaw(companded);
+            }
+        }
+        return table;
+    }();
+
+    return lut;
+}
+
+inline float clampSampleFast(float sample)
+{
+    if (sample < -kSampleClamp)
+        return -kSampleClamp;
+    if (sample > kSampleClamp)
+        return kSampleClamp;
+    return sample;
+}
+
+inline float clampPredictFast(float sample)
+{
+    if (sample < -kResidualPeakRange)
+        return -kResidualPeakRange;
+    if (sample > kResidualPeakRange)
+        return kResidualPeakRange;
+    return sample;
+}
+
+template <uint8_t Predictor>
+inline float predictSampleFast(float prev1, float prev2, float prev3)
+{
+    if constexpr (Predictor == 0)
+        return 0.0f;
+    else if constexpr (Predictor == 1)
+        return prev1;
+    else if constexpr (Predictor == 2)
+        return clampPredictFast(2.0f * prev1 - prev2);
+    else if constexpr (Predictor == 3)
+        return clampPredictFast(1.5f * prev1 - 0.5f * prev2);
+    else
+        return clampPredictFast(3.0f * prev1 - 3.0f * prev2 + prev3);
+}
+
+template <uint8_t Predictor>
+bool decodeBlockSamples(PackedBitReader& payloadReader,
+    uint8_t blockQuantBits,
+    const float* residualPeak,
+    uint8_t channels,
+    uint32_t framesInBlock,
+    float* prev1,
+    float* prev2,
+    float* prev3,
+    float* output)
+{
+    const float* residualDecodeLut = getResidualDecodeLut()[blockQuantBits].data();
+    size_t outIndex = 0;
+
+    for (uint32_t f = 0; f < framesInBlock; ++f)
+    {
+        for (uint8_t ch = 0; ch < channels; ++ch)
+        {
+            uint8_t code = 0;
+            if (!payloadReader.read(blockQuantBits, code))
+                return false;
+
+            const float pred = predictSampleFast<Predictor>(prev1[ch], prev2[ch], prev3[ch]);
+            const float sample = clampSampleFast(pred + residualDecodeLut[code] * residualPeak[ch]);
+            output[outIndex++] = sample;
+            prev3[ch] = prev2[ch];
+            prev2[ch] = prev1[ch];
+            prev1[ch] = sample;
+        }
+    }
+
+    return true;
 }
 
 std::vector<PlannedBlock> buildFixedBlockPlan(uint64_t totalFrames, uint32_t blockSizeFrames)
@@ -553,26 +641,39 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
         PackedBitReader payloadReader{ input.data() + offset, payloadBytes };
         offset += payloadBytes;
 
-        for (uint32_t f = 0; f < framesInBlock; ++f)
-        {
-            const uint64_t outBase = startSample + static_cast<uint64_t>(f) * hdr.channels;
-            for (uint8_t ch = 0; ch < hdr.channels; ++ch)
-            {
-                uint8_t code = 0;
-                if (!payloadReader.read(blockQuantBits, code))
-                {
-                    printf("Error! Truncated CWV block payload.\n");
-                    return 1;
-                }
+        float* const blockOutput = outputBuffer.data() + static_cast<size_t>(startSample);
+        float* const prev1Data = prev1.data();
+        float* const prev2Data = prev2.data();
+        float* const prev3Data = prev3.data();
+        const float* const residualPeakData = residualPeak.data();
 
-                const float pred = predictSample(predictor, prev1[ch], prev2[ch], prev3[ch]);
-                const float residual = decodeResidualCode(code, blockQuantBits, residualPeak[ch]);
-                const float sample = std::clamp(pred + residual, -kSampleClamp, kSampleClamp);
-                outputBuffer[static_cast<size_t>(outBase + ch)] = sample;
-                prev3[ch] = prev2[ch];
-                prev2[ch] = prev1[ch];
-                prev1[ch] = sample;
-            }
+        bool decodeOk = false;
+        switch (predictor)
+        {
+        case 0:
+            decodeOk = decodeBlockSamples<0>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            break;
+        case 1:
+            decodeOk = decodeBlockSamples<1>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            break;
+        case 2:
+            decodeOk = decodeBlockSamples<2>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            break;
+        case 3:
+            decodeOk = decodeBlockSamples<3>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            break;
+        case 4:
+            decodeOk = decodeBlockSamples<4>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            break;
+        default:
+            decodeOk = false;
+            break;
+        }
+
+        if (!decodeOk)
+        {
+            printf("Error! Truncated CWV block payload.\n");
+            return 1;
         }
     }
 
