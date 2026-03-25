@@ -266,8 +266,7 @@ void encodeBlockPayload(const audioStream& audio,
     const std::vector<uint16_t>& peakQ,
     std::vector<float>& statePrev1,
     std::vector<float>& statePrev2,
-    std::vector<uint8_t>& codes,
-    std::vector<float>* reconstructed = nullptr)
+    std::vector<uint8_t>& codes)
 {
     const uint32_t samplesInBlock = framesInBlock * audio.channels;
     const uint64_t startSample = static_cast<uint64_t>(startFrame) * audio.channels;
@@ -278,12 +277,6 @@ void encodeBlockPayload(const audioStream& audio,
     std::vector<float> decodedPeak(audio.channels, 0.0f);
     for (uint8_t ch = 0; ch < audio.channels; ++ch)
         decodedPeak[ch] = dequantizeResidualPeak(peakQ[ch]);
-
-    if (reconstructed != nullptr)
-    {
-        reconstructed->clear();
-        reconstructed->reserve(samplesInBlock);
-    }
 
     for (uint32_t f = 0; f < framesInBlock; ++f)
     {
@@ -297,8 +290,6 @@ void encodeBlockPayload(const audioStream& audio,
             const float outputSample = std::clamp(pred + reconResidual, -kSampleClamp, kSampleClamp);
 
             codes.push_back(code);
-            if (reconstructed != nullptr)
-                reconstructed->push_back(outputSample);
 
             statePrev2[ch] = statePrev1[ch];
             statePrev1[ch] = outputSample;
@@ -308,7 +299,7 @@ void encodeBlockPayload(const audioStream& audio,
 
 } // namespace
 
-std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uint8_t bitsPerSample, bool saveCompressed)
+std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uint8_t bitsPerSample)
 {
     if (audio.channels < 1 || audio.sampleRate <= 0 || audio.totalPCMFrameCount <= 0)
     {
@@ -390,10 +381,6 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
         rawQuantFlags |= kFlagBlockQuantMetadata;
     appendLE(out, rawQuantFlags);
 
-    FILE* cmprFile = nullptr;
-    if (saveCompressed)
-        openFile(&cmprFile, "compressed", "wb");
-
     std::vector<uint8_t> codes;
     std::vector<float> debugReconstructed;
     runningPrev1.assign(channels, 0.0f);
@@ -431,23 +418,16 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
             choice.peakQ,
             runningPrev1,
             runningPrev2,
-            codes,
-            (cmprFile != nullptr) ? &debugReconstructed : nullptr);
+            codes);
 
         const BitPack packed = packBitsFixed<uint8_t>(codes, choice.quantBits);
         out.insert(out.end(), packed.bytes.begin(), packed.bytes.end());
-
-        if (cmprFile != nullptr && !debugReconstructed.empty())
-            fwrite(debugReconstructed.data(), sizeof(float), debugReconstructed.size(), cmprFile);
 
         printEncodeProgress(b + 1u);
     }
 
     if (numberOfBlocks > 0)
         printf("\n");
-
-    if (cmprFile != nullptr)
-        fclose(cmprFile);
 
     printf("Encoding done. Output size: %s\n", printBytes(out.size()).c_str());
     return out;

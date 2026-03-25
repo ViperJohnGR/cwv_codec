@@ -15,7 +15,7 @@
 int main(int argc, char** argv)
 {
     if (argc < 2)
-        return printf("Usage: %s input [-bits N] [-block FRAMES] [-lowpass HZ] [-normalize] [-gain FLOAT] [-sc]\n", getFilenameFromPath(argv[0]).c_str());
+        return printf("Usage: %s input [-bits N] [-block FRAMES] [-lowpass HZ] [-normalize] [-gain FLOAT]\n", getFilenameFromPath(argv[0]).c_str());
 
     int bits = 4;
     uint32_t blockSize = 128;
@@ -26,7 +26,6 @@ int main(int argc, char** argv)
     bool expectfilename = false;
     bool expectlowpass = false;
     bool expectgain = false;
-    bool saveCompressed = false;
     bool normalize = false;
 
     std::string outputFilename = "output.wav";
@@ -38,8 +37,6 @@ int main(int argc, char** argv)
             expectbits = true;
         else if (strcmp(argv[i], "-block") == 0)
             expectblock = true;
-        else if (strcmp(argv[i], "-sc") == 0)
-            saveCompressed = true;
         else if (strcmp(argv[i], "-normalize") == 0)
             normalize = true;
         else if (strcmp(argv[i], "-gain") == 0)
@@ -104,7 +101,7 @@ int main(int argc, char** argv)
 
             printf("Starting encoder...\n");
             const auto encodeStart = std::chrono::steady_clock::now();
-            std::vector<uint8_t> outBuf = encodeCWV(inStream, blockSize, static_cast<uint8_t>(bits), saveCompressed);
+            std::vector<uint8_t> outBuf = encodeCWV(inStream, blockSize, static_cast<uint8_t>(bits));
             const auto encodeEnd = std::chrono::steady_clock::now();
             const auto encodeMs = std::chrono::duration_cast<std::chrono::milliseconds>(encodeEnd - encodeStart);
             printf("Encoder time: %lld ms (%.3f s)\n", static_cast<long long>(encodeMs.count()), std::chrono::duration<double>(encodeEnd - encodeStart).count());
