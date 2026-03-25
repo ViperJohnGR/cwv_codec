@@ -1,7 +1,8 @@
 #pragma once
 
-#include "sndfile.hh"
-#ifndef SNDFILE_HH
+#ifdef _WIN32
+    #include "sndfile.hh"
+#else
     #include "dr_wav.h"
 #endif
 #include <string>

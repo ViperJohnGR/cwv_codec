@@ -12,8 +12,6 @@
 
 namespace {
 
-constexpr bool kBlockQuantBitsInPackInfo = true;
-constexpr uint8_t kFlagBlockQuantMetadata = 0x80u;
 constexpr float kResidualPeakRange = 8.0f;
 constexpr float kMuLaw = 127.0f;
 constexpr float kSampleClamp = 1.0f;
@@ -376,10 +374,7 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
     appendLE(out, static_cast<uint32_t>(blockSizeFrames));
     appendLE(out, static_cast<uint32_t>(numberOfBlocks));
 
-    uint8_t rawQuantFlags = static_cast<uint8_t>(bitsPerSample & 0x7Fu);
-    if (kBlockQuantBitsInPackInfo)
-        rawQuantFlags |= kFlagBlockQuantMetadata;
-    appendLE(out, rawQuantFlags);
+    appendLE(out, bitsPerSample);
 
     std::vector<uint8_t> codes;
     std::vector<float> debugReconstructed;
@@ -405,7 +400,7 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
         const uint32_t framesInBlock = plan[b].frames;
         const BlockCandidate& choice = selected[b];
 
-        const uint8_t packInfo = static_cast<uint8_t>(((choice.predictor & 0x0Fu) << 4) | ((choice.quantBits - 1u) & 0x0Fu));
+        const uint8_t packInfo = static_cast<uint8_t>((choice.predictor & 0x0Fu) << 4);
         out.push_back(packInfo);
         for (uint8_t ch = 0; ch < channels; ++ch)
             appendLE(out, choice.peakQ[ch]);
@@ -458,11 +453,7 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
     if (!readLE(input, offset, hdr.blockSize)) return 1;
     if (!readLE(input, offset, hdr.numberOfBlocks)) return 1;
 
-    uint8_t rawQuantFlags = 0;
-    if (!readLE(input, offset, rawQuantFlags)) return 1;
-
-    hdr.adaptiveQuantization = (rawQuantFlags & kFlagBlockQuantMetadata) != 0;
-    hdr.quantBits = static_cast<uint8_t>(rawQuantFlags & 0x7Fu);
+    if (!readLE(input, offset, hdr.quantBits)) return 1;
 
     if (hdr.channels < 1 || hdr.numberOfBlocks == 0 || hdr.sampleRate == 0 || hdr.totalPCMFrameCount <= 0)
     {
@@ -508,9 +499,7 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
         }
         const uint8_t packInfo = input[offset++];
         const uint8_t predictor = static_cast<uint8_t>(packInfo >> 4);
-        const uint8_t blockQuantBits = hdr.adaptiveQuantization
-            ? static_cast<uint8_t>((packInfo & 0x0Fu) + 1u)
-            : hdr.quantBits;
+        const uint8_t blockQuantBits = hdr.quantBits;
 
         if (predictor > 2)
         {

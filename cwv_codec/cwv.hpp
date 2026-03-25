@@ -14,14 +14,13 @@
 //     s64     totalPCMFrameCount
 //     u32     blockSize      (fixed block size in PCM frames)
 //     u32     numberOfBlocks
-//     u8      quantFlags
-//              - bit 7 = block-local quantization metadata present in packInfo
-//              - bits 6:0 = nominal quant bits (1..8)
+//     u8      quantBits
+//              - fixed quant bits for the whole file (1..8)
 //
 //   Then for each block:
 //     u8      packInfo
 //              - high nibble = predictor (0 = none, 1 = 1st-order, 2 = 2nd-order)
-//              - low  nibble = block quant bits minus 1 (0..7 -> 1..8 bits)
+//              - low  nibble = reserved and written as 0
 //     u16     residualPeakQ[channels]
 //              - block-local peak residual scale per channel, mapped to [0, 8]
 //     ...     audioData
@@ -44,8 +43,7 @@ struct CWVHeader
     int64_t totalPCMFrameCount = 0;
     uint32_t blockSize = 0; // fixed-size files only
     uint32_t numberOfBlocks = 0;
-    uint8_t quantBits = 0;  // nominal quant bits only
-    bool adaptiveQuantization = false;
+    uint8_t quantBits = 0;
 };
 
 // Produces a complete CWV file buffer (header + blocks).
