@@ -14,9 +14,11 @@
 namespace {
 
 constexpr float kResidualPeakRange = 8.0f;
+constexpr float kResidualPeakMin = 1.0e-9f;
 constexpr float kMuLaw = 127.0f;
 constexpr float kSampleClamp = 1.0f;
 constexpr float kSilentPeakEpsilon = 1e-12f;
+constexpr uint8_t kMinQuantBits = 2;
 
 struct PlannedBlock
 {
@@ -117,13 +119,26 @@ float predictSample(uint8_t predictor, float prev1, float prev2, float prev3)
 
 uint16_t quantizeResidualPeak(float peak)
 {
-    peak = std::clamp(peak, 0.0f, kResidualPeakRange);
-    return static_cast<uint16_t>(std::lround((peak / kResidualPeakRange) * 65535.0f));
+    if (!(peak > kSilentPeakEpsilon))
+        return 0;
+
+    peak = std::clamp(peak, kResidualPeakMin, kResidualPeakRange);
+    static const float logMin = std::log(kResidualPeakMin);
+    static const float logRange = std::log(kResidualPeakRange) - logMin;
+    const float normalized = (std::log(peak) - logMin) / logRange;
+    const uint32_t quantized = 1u + static_cast<uint32_t>(std::lround(normalized * 65534.0f));
+    return static_cast<uint16_t>(std::min<uint32_t>(quantized, 65535u));
 }
 
 float dequantizeResidualPeak(uint16_t peakQ)
 {
-    return (static_cast<float>(peakQ) / 65535.0f) * kResidualPeakRange;
+    if (peakQ == 0)
+        return 0.0f;
+
+    static const float logMin = std::log(kResidualPeakMin);
+    static const float logRange = std::log(kResidualPeakRange) - logMin;
+    const float normalized = static_cast<float>(peakQ - 1u) / 65534.0f;
+    return std::exp(logMin + normalized * logRange);
 }
 
 float compandMuLaw(float x)
@@ -148,32 +163,33 @@ float expandMuLaw(float y)
     return std::copysign(x, y);
 }
 
-uint8_t encodeResidualCode(float residual, uint8_t quantBits, float residualPeak)
+int32_t decodeSignedResidualCode(uint8_t code, uint8_t quantBits)
 {
-    if (quantBits < 1 || quantBits > 8)
-        return 0;
-
-    const uint32_t maxCode = (1u << quantBits) - 1u;
-    if (residualPeak <= kSilentPeakEpsilon || maxCode == 0)
-        return 0;
-
-    const float normalized = std::clamp(residual / residualPeak, -1.0f, 1.0f);
-    const float companded = compandMuLaw(normalized);
-    const float mapped = (companded * 0.5f + 0.5f) * static_cast<float>(maxCode);
-    return static_cast<uint8_t>(std::clamp<int>(static_cast<int>(std::lround(mapped)), 0, static_cast<int>(maxCode)));
+    const uint32_t codeRange = 1u << quantBits;
+    const uint32_t mask = codeRange - 1u;
+    const uint32_t signBit = codeRange >> 1u;
+    const uint32_t value = static_cast<uint32_t>(code) & mask;
+    int32_t quantized = (value & signBit) != 0u
+        ? static_cast<int32_t>(value) - static_cast<int32_t>(codeRange)
+        : static_cast<int32_t>(value);
+    const int32_t maxMagnitude = static_cast<int32_t>(signBit) - 1;
+    return std::clamp(quantized, -maxMagnitude, maxMagnitude);
 }
 
-float decodeResidualCode(uint8_t code, uint8_t quantBits, float residualPeak)
+uint8_t encodeResidualCode(float residual, uint8_t quantBits, float residualPeak)
 {
-    if (quantBits < 1 || quantBits > 8)
-        return 0.0f;
+    if (quantBits < kMinQuantBits || quantBits > 8 || residualPeak <= kSilentPeakEpsilon)
+        return 0;
 
-    const uint32_t maxCode = (1u << quantBits) - 1u;
-    if (residualPeak <= kSilentPeakEpsilon || maxCode == 0)
-        return 0.0f;
-
-    const float companded = (static_cast<float>(code) * 2.0f / static_cast<float>(maxCode)) - 1.0f;
-    return expandMuLaw(companded) * residualPeak;
+    const int32_t maxMagnitude = static_cast<int32_t>((1u << (quantBits - 1u)) - 1u);
+    const float normalized = std::clamp(residual / residualPeak, -1.0f, 1.0f);
+    const float companded = compandMuLaw(normalized);
+    const int32_t quantized = std::clamp(
+        static_cast<int32_t>(std::lround(companded * static_cast<float>(maxMagnitude))),
+        -maxMagnitude,
+        maxMagnitude);
+    const int32_t codeRange = static_cast<int32_t>(1u << quantBits);
+    return static_cast<uint8_t>(quantized < 0 ? quantized + codeRange : quantized);
 }
 
 const std::array<std::array<float, 256>, 9>& getResidualDecodeLut()
@@ -181,13 +197,15 @@ const std::array<std::array<float, 256>, 9>& getResidualDecodeLut()
     static const std::array<std::array<float, 256>, 9> lut = []
     {
         std::array<std::array<float, 256>, 9> table{};
-        for (uint8_t quantBits = 1; quantBits <= 8; ++quantBits)
+        for (uint8_t quantBits = kMinQuantBits; quantBits <= 8; ++quantBits)
         {
             const uint32_t maxCode = (1u << quantBits) - 1u;
+            const int32_t maxMagnitude = static_cast<int32_t>((1u << (quantBits - 1u)) - 1u);
             for (uint32_t code = 0; code <= maxCode; ++code)
             {
-                const float companded = (static_cast<float>(code) * 2.0f / static_cast<float>(maxCode)) - 1.0f;
-                table[quantBits][code] = expandMuLaw(companded);
+                const int32_t quantized = decodeSignedResidualCode(static_cast<uint8_t>(code), quantBits);
+                table[quantBits][code] = expandMuLaw(
+                    static_cast<float>(quantized) / static_cast<float>(maxMagnitude));
             }
         }
         return table;
@@ -283,6 +301,81 @@ std::vector<PlannedBlock> buildFixedBlockPlan(uint64_t totalFrames, uint32_t blo
     return plan;
 }
 
+struct ChannelScaleResult
+{
+    double distortion = std::numeric_limits<double>::infinity();
+    float endPrev1 = 0.0f;
+    float endPrev2 = 0.0f;
+    float endPrev3 = 0.0f;
+    float maxResidual = 0.0f;
+};
+
+ChannelScaleResult evaluateChannelScale(const audioStream& audio,
+    uint32_t startFrame,
+    uint32_t framesInBlock,
+    uint8_t channel,
+    uint8_t quantBits,
+    uint8_t predictor,
+    float residualPeak,
+    float startPrev1,
+    float startPrev2,
+    float startPrev3)
+{
+    ChannelScaleResult result{};
+    result.distortion = 0.0;
+
+    float prev1 = startPrev1;
+    float prev2 = startPrev2;
+    float prev3 = startPrev3;
+    const uint64_t startSample = static_cast<uint64_t>(startFrame) * audio.channels;
+    const float* residualDecodeLut = getResidualDecodeLut()[quantBits].data();
+
+    for (uint32_t f = 0; f < framesInBlock; ++f)
+    {
+        const uint64_t sampleIndex = startSample + static_cast<uint64_t>(f) * audio.channels + channel;
+        const float inputSample = std::clamp(audio.sampleData[sampleIndex], -kSampleClamp, kSampleClamp);
+        const float pred = predictSample(predictor, prev1, prev2, prev3);
+        const float residual = inputSample - pred;
+        result.maxResidual = std::max(result.maxResidual, std::fabs(residual));
+
+        const uint8_t code = encodeResidualCode(residual, quantBits, residualPeak);
+        const float reconstructed = std::clamp(
+            pred + residualDecodeLut[code] * residualPeak,
+            -kSampleClamp,
+            kSampleClamp);
+        const double error = static_cast<double>(reconstructed) - static_cast<double>(inputSample);
+        result.distortion += error * error;
+
+        prev3 = prev2;
+        prev2 = prev1;
+        prev1 = reconstructed;
+    }
+
+    result.endPrev1 = prev1;
+    result.endPrev2 = prev2;
+    result.endPrev3 = prev3;
+    return result;
+}
+
+float sortedQuantile(const std::vector<float>& sortedValues, float quantile)
+{
+    if (sortedValues.empty())
+        return 0.0f;
+
+    const float position = quantile * static_cast<float>(sortedValues.size() - 1u);
+    const size_t lower = static_cast<size_t>(position);
+    const size_t upper = std::min(lower + 1u, sortedValues.size() - 1u);
+    const float fraction = position - static_cast<float>(lower);
+    return sortedValues[lower] + (sortedValues[upper] - sortedValues[lower]) * fraction;
+}
+
+void addPeakCandidate(std::vector<uint16_t>& candidates, float peak)
+{
+    const uint16_t peakQ = quantizeResidualPeak(peak);
+    if (std::find(candidates.begin(), candidates.end(), peakQ) == candidates.end())
+        candidates.push_back(peakQ);
+}
+
 BlockCandidate evaluateBlockCandidate(const audioStream& audio,
     uint32_t startFrame,
     uint32_t framesInBlock,
@@ -299,11 +392,14 @@ BlockCandidate evaluateBlockCandidate(const audioStream& audio,
     candidate.endPrev1 = startPrev1;
     candidate.endPrev2 = startPrev2;
     candidate.endPrev3 = startPrev3;
+    candidate.distortion = 0.0;
 
     std::vector<float> analysisPrev1 = startPrev1;
     std::vector<float> analysisPrev2 = startPrev2;
     std::vector<float> analysisPrev3 = startPrev3;
-    std::vector<float> residualPeak(audio.channels, 0.0f);
+    std::vector<std::vector<float>> residualMagnitudes(audio.channels);
+    for (auto& values : residualMagnitudes)
+        values.reserve(framesInBlock);
 
     const uint64_t startSample = static_cast<uint64_t>(startFrame) * audio.channels;
     for (uint32_t f = 0; f < framesInBlock; ++f)
@@ -313,46 +409,79 @@ BlockCandidate evaluateBlockCandidate(const audioStream& audio,
         {
             const float sample = std::clamp(audio.sampleData[base + ch], -kSampleClamp, kSampleClamp);
             const float pred = predictSample(predictor, analysisPrev1[ch], analysisPrev2[ch], analysisPrev3[ch]);
-            residualPeak[ch] = std::max(residualPeak[ch], std::fabs(sample - pred));
+            residualMagnitudes[ch].push_back(std::fabs(sample - pred));
             analysisPrev3[ch] = analysisPrev2[ch];
             analysisPrev2[ch] = analysisPrev1[ch];
             analysisPrev1[ch] = sample;
         }
     }
 
-    std::vector<float> decodedPeak(audio.channels, 0.0f);
+    static constexpr std::array<float, 7> kScaleQuantiles = {
+        0.75f, 0.85f, 0.90f, 0.95f, 0.98f, 0.995f, 1.0f
+    };
+
     for (uint8_t ch = 0; ch < audio.channels; ++ch)
     {
-        candidate.peakQ[ch] = quantizeResidualPeak(residualPeak[ch]);
-        decodedPeak[ch] = dequantizeResidualPeak(candidate.peakQ[ch]);
-    }
+        std::vector<float>& magnitudes = residualMagnitudes[ch];
+        std::sort(magnitudes.begin(), magnitudes.end());
 
-    std::vector<float> reconPrev1 = startPrev1;
-    std::vector<float> reconPrev2 = startPrev2;
-    std::vector<float> reconPrev3 = startPrev3;
-    candidate.distortion = 0.0;
+        std::vector<uint16_t> peakCandidates;
+        peakCandidates.reserve(24);
+        addPeakCandidate(peakCandidates, 0.0f);
+        for (const float quantile : kScaleQuantiles)
+            addPeakCandidate(peakCandidates, sortedQuantile(magnitudes, quantile));
 
-    for (uint32_t f = 0; f < framesInBlock; ++f)
-    {
-        const uint64_t base = startSample + static_cast<uint64_t>(f) * audio.channels;
-        for (uint8_t ch = 0; ch < audio.channels; ++ch)
+        const float openLoopMax = magnitudes.empty() ? 0.0f : magnitudes.back();
+        addPeakCandidate(peakCandidates, openLoopMax * 1.10f);
+        addPeakCandidate(peakCandidates, openLoopMax * 1.25f);
+
+        uint16_t bestPeakQ = 0;
+        ChannelScaleResult bestResult{};
+        size_t evaluatedCount = 0;
+
+        for (uint32_t refinement = 0; refinement < 3; ++refinement)
         {
-            const float inputSample = std::clamp(audio.sampleData[base + ch], -kSampleClamp, kSampleClamp);
-            const float pred = predictSample(predictor, reconPrev1[ch], reconPrev2[ch], reconPrev3[ch]);
-            const uint8_t code = encodeResidualCode(inputSample - pred, quantBits, decodedPeak[ch]);
-            const float reconResidual = decodeResidualCode(code, quantBits, decodedPeak[ch]);
-            const float reconstructed = std::clamp(pred + reconResidual, -kSampleClamp, kSampleClamp);
-            const double err = static_cast<double>(reconstructed) - static_cast<double>(inputSample);
-            candidate.distortion += err * err;
-            reconPrev3[ch] = reconPrev2[ch];
-            reconPrev2[ch] = reconPrev1[ch];
-            reconPrev1[ch] = reconstructed;
+            while (evaluatedCount < peakCandidates.size())
+            {
+                const uint16_t peakQ = peakCandidates[evaluatedCount++];
+                const float decodedPeak = dequantizeResidualPeak(peakQ);
+                const ChannelScaleResult result = evaluateChannelScale(
+                    audio,
+                    startFrame,
+                    framesInBlock,
+                    ch,
+                    quantBits,
+                    predictor,
+                    decodedPeak,
+                    startPrev1[ch],
+                    startPrev2[ch],
+                    startPrev3[ch]);
+
+                if (result.distortion < bestResult.distortion)
+                {
+                    bestResult = result;
+                    bestPeakQ = peakQ;
+                }
+            }
+
+            if (refinement + 1u < 3u)
+            {
+                const float bestPeak = dequantizeResidualPeak(bestPeakQ);
+                addPeakCandidate(peakCandidates, bestPeak * 0.90f);
+                addPeakCandidate(peakCandidates, bestPeak * 1.10f);
+                addPeakCandidate(peakCandidates, bestResult.maxResidual * 0.90f);
+                addPeakCandidate(peakCandidates, bestResult.maxResidual);
+                addPeakCandidate(peakCandidates, bestResult.maxResidual * 1.10f);
+            }
         }
+
+        candidate.peakQ[ch] = bestPeakQ;
+        candidate.distortion += bestResult.distortion;
+        candidate.endPrev1[ch] = bestResult.endPrev1;
+        candidate.endPrev2[ch] = bestResult.endPrev2;
+        candidate.endPrev3[ch] = bestResult.endPrev3;
     }
 
-    candidate.endPrev1 = std::move(reconPrev1);
-    candidate.endPrev2 = std::move(reconPrev2);
-    candidate.endPrev3 = std::move(reconPrev3);
     return candidate;
 }
 
@@ -376,6 +505,7 @@ void encodeBlockPayload(const audioStream& audio,
     std::vector<float> decodedPeak(audio.channels, 0.0f);
     for (uint8_t ch = 0; ch < audio.channels; ++ch)
         decodedPeak[ch] = dequantizeResidualPeak(peakQ[ch]);
+    const float* residualDecodeLut = getResidualDecodeLut()[quantBits].data();
 
     for (uint32_t f = 0; f < framesInBlock; ++f)
     {
@@ -385,7 +515,7 @@ void encodeBlockPayload(const audioStream& audio,
             const float inputSample = std::clamp(audio.sampleData[base + ch], -kSampleClamp, kSampleClamp);
             const float pred = predictSample(predictor, statePrev1[ch], statePrev2[ch], statePrev3[ch]);
             const uint8_t code = encodeResidualCode(inputSample - pred, quantBits, decodedPeak[ch]);
-            const float reconResidual = decodeResidualCode(code, quantBits, decodedPeak[ch]);
+            const float reconResidual = residualDecodeLut[code] * decodedPeak[ch];
             const float outputSample = std::clamp(pred + reconResidual, -kSampleClamp, kSampleClamp);
 
             codes.push_back(code);
@@ -406,9 +536,9 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
         printf("Error! Invalid audioStream metadata.\n");
         return {};
     }
-    if (bitsPerSample < 1 || bitsPerSample > 8)
+    if (bitsPerSample < kMinQuantBits || bitsPerSample > 8)
     {
-        printf("Error! bitsPerSample must be in [1, 8].\n");
+        printf("Error! bitsPerSample must be in [2, 8].\n");
         return {};
     }
     if (blockSizeFrames == 0)
@@ -481,7 +611,6 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
     appendLE(out, bitsPerSample);
 
     std::vector<uint8_t> codes;
-    std::vector<float> debugReconstructed;
     runningPrev1.assign(channels, 0.0f);
     runningPrev2.assign(channels, 0.0f);
     runningPrev3.assign(channels, 0.0f);
@@ -571,7 +700,7 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
         printf("Error! Invalid fixed block size.\n");
         return 1;
     }
-    if (hdr.quantBits < 1 || hdr.quantBits > 8)
+    if (hdr.quantBits < kMinQuantBits || hdr.quantBits > 8)
     {
         printf("Error! Invalid quantBits (%u).\n", hdr.quantBits);
         return 1;
@@ -613,7 +742,7 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
             printf("Error! Invalid predictor type (%u).\n", predictor);
             return 1;
         }
-        if (blockQuantBits < 1 || blockQuantBits > 8)
+        if (blockQuantBits < kMinQuantBits || blockQuantBits > 8)
         {
             printf("Error! Invalid block quantBits (%u).\n", blockQuantBits);
             return 1;

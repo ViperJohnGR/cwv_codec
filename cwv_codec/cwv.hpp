@@ -33,8 +33,6 @@
 //              - bit-packed interleaved residual codes for every sample in the block
 //
 // Notes:
-// - This revision is intentionally not backward compatible with the previous
-//   gain-normalized seed/residual format.
 // - Stereo is coded as independent channels; no side/mid transform is used.
 // - Predictor state carries across block boundaries, which reduces block-edge
 //   discontinuities compared with restarting prediction every block.
