@@ -3,12 +3,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <barrier>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -176,20 +180,82 @@ int32_t decodeSignedResidualCode(uint8_t code, uint8_t quantBits)
     return std::clamp(quantized, -maxMagnitude, maxMagnitude);
 }
 
-uint8_t encodeResidualCode(float residual, uint8_t quantBits, float residualPeak)
+int32_t quantizeResidualMagnitudeReference(float normalizedMagnitude, uint32_t maxMagnitude)
 {
-    if (quantBits < kMinQuantBits || quantBits > 8 || residualPeak <= kSilentPeakEpsilon)
+    const float companded = compandMuLaw(normalizedMagnitude);
+    return std::clamp(
+        static_cast<int32_t>(std::lround(companded * static_cast<float>(maxMagnitude))),
+        0,
+        static_cast<int32_t>(maxMagnitude));
+}
+
+const std::array<std::array<float, 127>, 9>& getResidualEncodeThresholds()
+{
+    // The encoder is monotonic for |residual / peak| in [0, 1]. Find the exact
+    // float at which each magnitude code begins, once, then use comparisons in
+    // the hot loop. Searching float bit patterns preserves the old quantizer's
+    // mapping (including its float rounding) without a log1p() per sample.
+    static const std::array<std::array<float, 127>, 9> thresholds = []
+    {
+        std::array<std::array<float, 127>, 9> table{};
+        constexpr uint32_t oneBits = std::bit_cast<uint32_t>(1.0f);
+
+        for (uint8_t quantBits = kMinQuantBits; quantBits <= 8; ++quantBits)
+        {
+            const uint32_t maxMagnitude = (1u << (quantBits - 1u)) - 1u;
+            for (uint32_t q = 1; q <= maxMagnitude; ++q)
+            {
+                uint32_t low = 0u;
+                uint32_t high = oneBits;
+                while (low < high)
+                {
+                    const uint32_t mid = low + ((high - low) >> 1u);
+                    const float x = std::bit_cast<float>(mid);
+                    if (quantizeResidualMagnitudeReference(x, maxMagnitude) >= static_cast<int32_t>(q))
+                        high = mid;
+                    else
+                        low = mid + 1u;
+                }
+                table[quantBits][q - 1u] = std::bit_cast<float>(low);
+            }
+        }
+        return table;
+    }();
+
+    return thresholds;
+}
+
+inline uint8_t encodeResidualCodeFast(float residual,
+    float residualPeak,
+    uint8_t quantBits,
+    const float* thresholds,
+    uint32_t maxMagnitude)
+{
+    if (residualPeak <= kSilentPeakEpsilon)
         return 0;
 
-    const int32_t maxMagnitude = static_cast<int32_t>((1u << (quantBits - 1u)) - 1u);
-    const float normalized = std::clamp(residual / residualPeak, -1.0f, 1.0f);
-    const float companded = compandMuLaw(normalized);
-    const int32_t quantized = std::clamp(
-        static_cast<int32_t>(std::lround(companded * static_cast<float>(maxMagnitude))),
-        -maxMagnitude,
+    const float normalizedMagnitude = std::min(std::fabs(residual / residualPeak), 1.0f);
+    const uint32_t magnitude = static_cast<uint32_t>(
+        std::upper_bound(thresholds, thresholds + maxMagnitude, normalizedMagnitude) - thresholds);
+
+    if (residual >= 0.0f || magnitude == 0u)
+        return static_cast<uint8_t>(magnitude);
+
+    return static_cast<uint8_t>((1u << quantBits) - magnitude);
+}
+
+uint8_t encodeResidualCode(float residual, uint8_t quantBits, float residualPeak)
+{
+    if (quantBits < kMinQuantBits || quantBits > 8)
+        return 0;
+
+    const uint32_t maxMagnitude = (1u << (quantBits - 1u)) - 1u;
+    return encodeResidualCodeFast(
+        residual,
+        residualPeak,
+        quantBits,
+        getResidualEncodeThresholds()[quantBits].data(),
         maxMagnitude);
-    const int32_t codeRange = static_cast<int32_t>(1u << quantBits);
-    return static_cast<uint8_t>(quantized < 0 ? quantized + codeRange : quantized);
 }
 
 const std::array<std::array<float, 256>, 9>& getResidualDecodeLut()
@@ -310,12 +376,12 @@ struct ChannelScaleResult
     float maxResidual = 0.0f;
 };
 
+template <uint8_t Predictor>
 ChannelScaleResult evaluateChannelScale(const audioStream& audio,
     uint32_t startFrame,
     uint32_t framesInBlock,
     uint8_t channel,
     uint8_t quantBits,
-    uint8_t predictor,
     float residualPeak,
     float startPrev1,
     float startPrev2,
@@ -327,22 +393,25 @@ ChannelScaleResult evaluateChannelScale(const audioStream& audio,
     float prev1 = startPrev1;
     float prev2 = startPrev2;
     float prev3 = startPrev3;
-    const uint64_t startSample = static_cast<uint64_t>(startFrame) * audio.channels;
+    const float* input = audio.sampleData.data()
+        + static_cast<size_t>(startFrame) * audio.channels
+        + channel;
+    const size_t stride = audio.channels;
     const float* residualDecodeLut = getResidualDecodeLut()[quantBits].data();
+    const float* encodeThresholds = getResidualEncodeThresholds()[quantBits].data();
+    const uint32_t maxMagnitude = (1u << (quantBits - 1u)) - 1u;
 
-    for (uint32_t f = 0; f < framesInBlock; ++f)
+    for (uint32_t f = 0; f < framesInBlock; ++f, input += stride)
     {
-        const uint64_t sampleIndex = startSample + static_cast<uint64_t>(f) * audio.channels + channel;
-        const float inputSample = std::clamp(audio.sampleData[sampleIndex], -kSampleClamp, kSampleClamp);
-        const float pred = predictSample(predictor, prev1, prev2, prev3);
+        const float inputSample = clampSampleFast(*input);
+        const float pred = predictSampleFast<Predictor>(prev1, prev2, prev3);
         const float residual = inputSample - pred;
         result.maxResidual = std::max(result.maxResidual, std::fabs(residual));
 
-        const uint8_t code = encodeResidualCode(residual, quantBits, residualPeak);
-        const float reconstructed = std::clamp(
-            pred + residualDecodeLut[code] * residualPeak,
-            -kSampleClamp,
-            kSampleClamp);
+        const uint8_t code = encodeResidualCodeFast(
+            residual, residualPeak, quantBits, encodeThresholds, maxMagnitude);
+        const float reconstructed = clampSampleFast(
+            pred + residualDecodeLut[code] * residualPeak);
         const double error = static_cast<double>(reconstructed) - static_cast<double>(inputSample);
         result.distortion += error * error;
 
@@ -376,17 +445,17 @@ void addPeakCandidate(std::vector<uint16_t>& candidates, float peak)
         candidates.push_back(peakQ);
 }
 
+template <uint8_t Predictor>
 BlockCandidate evaluateBlockCandidate(const audioStream& audio,
     uint32_t startFrame,
     uint32_t framesInBlock,
     uint8_t quantBits,
-    uint8_t predictor,
     const std::vector<float>& startPrev1,
     const std::vector<float>& startPrev2,
     const std::vector<float>& startPrev3)
 {
     BlockCandidate candidate{};
-    candidate.predictor = predictor;
+    candidate.predictor = Predictor;
     candidate.quantBits = quantBits;
     candidate.peakQ.assign(audio.channels, 0u);
     candidate.endPrev1 = startPrev1;
@@ -408,7 +477,7 @@ BlockCandidate evaluateBlockCandidate(const audioStream& audio,
         for (uint8_t ch = 0; ch < audio.channels; ++ch)
         {
             const float sample = std::clamp(audio.sampleData[base + ch], -kSampleClamp, kSampleClamp);
-            const float pred = predictSample(predictor, analysisPrev1[ch], analysisPrev2[ch], analysisPrev3[ch]);
+            const float pred = predictSampleFast<Predictor>(analysisPrev1[ch], analysisPrev2[ch], analysisPrev3[ch]);
             residualMagnitudes[ch].push_back(std::fabs(sample - pred));
             analysisPrev3[ch] = analysisPrev2[ch];
             analysisPrev2[ch] = analysisPrev1[ch];
@@ -445,13 +514,12 @@ BlockCandidate evaluateBlockCandidate(const audioStream& audio,
             {
                 const uint16_t peakQ = peakCandidates[evaluatedCount++];
                 const float decodedPeak = dequantizeResidualPeak(peakQ);
-                const ChannelScaleResult result = evaluateChannelScale(
+                const ChannelScaleResult result = evaluateChannelScale<Predictor>(
                     audio,
                     startFrame,
                     framesInBlock,
                     ch,
                     quantBits,
-                    predictor,
                     decodedPeak,
                     startPrev1[ch],
                     startPrev2[ch],
@@ -484,6 +552,151 @@ BlockCandidate evaluateBlockCandidate(const audioStream& audio,
 
     return candidate;
 }
+
+void evaluateBlockCandidateByPredictor(uint8_t predictor,
+    const audioStream& audio,
+    uint32_t startFrame,
+    uint32_t framesInBlock,
+    uint8_t quantBits,
+    const std::vector<float>& startPrev1,
+    const std::vector<float>& startPrev2,
+    const std::vector<float>& startPrev3,
+    BlockCandidate& output)
+{
+    switch (predictor)
+    {
+    case 0:
+        output = evaluateBlockCandidate<0>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        break;
+    case 1:
+        output = evaluateBlockCandidate<1>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        break;
+    case 2:
+        output = evaluateBlockCandidate<2>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        break;
+    case 3:
+        output = evaluateBlockCandidate<3>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        break;
+    default:
+        output = evaluateBlockCandidate<4>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        break;
+    }
+}
+
+class BlockAnalysisPool
+{
+public:
+    BlockAnalysisPool(const audioStream& audio, uint8_t quantBits, unsigned workerCount)
+        : audio_(audio),
+          quantBits_(quantBits),
+          workerCount_(workerCount),
+          startBarrier_(static_cast<std::ptrdiff_t>(workerCount + 1u)),
+          finishBarrier_(static_cast<std::ptrdiff_t>(workerCount + 1u))
+    {
+        workers_.reserve(workerCount_);
+        for (unsigned i = 0; i < workerCount_; ++i)
+            workers_.emplace_back([this] { workerMain(); });
+    }
+
+    ~BlockAnalysisPool()
+    {
+        if (workerCount_ == 0)
+            return;
+
+        stopping_.store(true, std::memory_order_relaxed);
+        startBarrier_.arrive_and_wait();
+        for (std::thread& worker : workers_)
+            worker.join();
+    }
+
+    BlockCandidate analyze(uint32_t startFrame,
+        uint32_t framesInBlock,
+        const std::vector<float>& startPrev1,
+        const std::vector<float>& startPrev2,
+        const std::vector<float>& startPrev3)
+    {
+        startFrame_ = startFrame;
+        framesInBlock_ = framesInBlock;
+        startPrev1_ = &startPrev1;
+        startPrev2_ = &startPrev2;
+        startPrev3_ = &startPrev3;
+
+        if (workerCount_ == 0)
+        {
+            for (uint8_t predictor = 0; predictor <= 4; ++predictor)
+                evaluateOne(predictor);
+        }
+        else
+        {
+            nextPredictor_.store(0u, std::memory_order_relaxed);
+            startBarrier_.arrive_and_wait();
+            runAvailableJobs();
+            finishBarrier_.arrive_and_wait();
+        }
+
+        BlockCandidate best = candidates_[0];
+        for (uint8_t predictor = 1; predictor <= 4; ++predictor)
+        {
+            if (candidates_[predictor].distortion < best.distortion)
+                best = candidates_[predictor];
+        }
+        return best;
+    }
+
+private:
+    void workerMain()
+    {
+        for (;;)
+        {
+            startBarrier_.arrive_and_wait();
+            if (stopping_.load(std::memory_order_relaxed))
+                return;
+
+            runAvailableJobs();
+            finishBarrier_.arrive_and_wait();
+        }
+    }
+
+    void runAvailableJobs()
+    {
+        for (;;)
+        {
+            const unsigned predictor = nextPredictor_.fetch_add(1u, std::memory_order_relaxed);
+            if (predictor > 4u)
+                return;
+            evaluateOne(static_cast<uint8_t>(predictor));
+        }
+    }
+
+    void evaluateOne(uint8_t predictor)
+    {
+        evaluateBlockCandidateByPredictor(
+            predictor,
+            audio_,
+            startFrame_,
+            framesInBlock_,
+            quantBits_,
+            *startPrev1_,
+            *startPrev2_,
+            *startPrev3_,
+            candidates_[predictor]);
+    }
+
+    const audioStream& audio_;
+    uint8_t quantBits_ = 0;
+    unsigned workerCount_ = 0;
+    std::barrier<> startBarrier_;
+    std::barrier<> finishBarrier_;
+    std::vector<std::thread> workers_;
+    std::atomic<unsigned> nextPredictor_{ 0u };
+    std::atomic<bool> stopping_{ false };
+    uint32_t startFrame_ = 0;
+    uint32_t framesInBlock_ = 0;
+    const std::vector<float>* startPrev1_ = nullptr;
+    const std::vector<float>* startPrev2_ = nullptr;
+    const std::vector<float>* startPrev3_ = nullptr;
+    std::array<BlockCandidate, 5> candidates_{};
+};
 
 void encodeBlockPayload(const audioStream& audio,
     uint32_t startFrame,
@@ -559,11 +772,21 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
     const uint32_t numberOfBlocks = static_cast<uint32_t>(plan.size());
     printf("Using fixed-size block plan with %u blocks.\n", numberOfBlocks);
     printf("Analyzing %u blocks...\n", numberOfBlocks);
+    const auto analysisStart = std::chrono::steady_clock::now();
 
     std::vector<BlockCandidate> selected(numberOfBlocks);
     std::vector<float> runningPrev1(channels, 0.0f);
     std::vector<float> runningPrev2(channels, 0.0f);
     std::vector<float> runningPrev3(channels, 0.0f);
+
+    const unsigned hardwareThreads = std::thread::hardware_concurrency();
+    const unsigned analysisWorkers = numberOfBlocks >= 64u && hardwareThreads > 1u
+        ? std::min(4u, hardwareThreads - 1u)
+        : 0u;
+    if (analysisWorkers > 0u)
+        printf("Analysis threads: %u\n", analysisWorkers + 1u);
+
+    BlockAnalysisPool analysisPool(audio, bitsPerSample, analysisWorkers);
 
     unsigned lastPercent = 101;
     for (uint32_t b = 0; b < numberOfBlocks; ++b)
@@ -579,13 +802,12 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
         const uint32_t startFrame = plan[b].startFrame;
         const uint32_t framesInBlock = plan[b].frames;
 
-        BlockCandidate best = evaluateBlockCandidate(audio, startFrame, framesInBlock, bitsPerSample, 0u, runningPrev1, runningPrev2, runningPrev3);
-        for (uint8_t predictor = 1; predictor <= 4; ++predictor)
-        {
-            const BlockCandidate candidate = evaluateBlockCandidate(audio, startFrame, framesInBlock, bitsPerSample, predictor, runningPrev1, runningPrev2, runningPrev3);
-            if (candidate.distortion < best.distortion)
-                best = candidate;
-        }
+        BlockCandidate best = analysisPool.analyze(
+            startFrame,
+            framesInBlock,
+            runningPrev1,
+            runningPrev2,
+            runningPrev3);
 
         selected[b] = best;
         runningPrev1 = best.endPrev1;
@@ -593,6 +815,8 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
         runningPrev3 = best.endPrev3;
     }
     printf("\n");
+    const auto analysisEnd = std::chrono::steady_clock::now();
+    printf("Analysis time: %.3f s\n", std::chrono::duration<double>(analysisEnd - analysisStart).count());
 
     uint64_t payloadBytes = 0;
     for (const PlannedBlock& block : plan)

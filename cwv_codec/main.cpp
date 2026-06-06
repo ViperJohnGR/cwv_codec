@@ -217,9 +217,15 @@ std::string makeOutputPath(const std::string& inputPath, const ProgramOptions& o
 
         return options.outputFilename + (isCWVPath(inputPath) ? ".wav" : ".cwv");
     }
-
+    /*
     std::string outputPath = removeExtensionFromPath(inputPath);
     outputPath += isCWVPath(inputPath) ? ".wav" : ".cwv";
+    */
+    std::string outputPath = removeExtensionFromPath(inputPath);
+    if (isCWVPath(inputPath))
+        outputPath = "output.wav";
+    else
+        outputPath += ".cwv";
     return outputPath;
 }
 
