@@ -26,6 +26,12 @@
 //                  2 = 2nd-order extrapolation
 //                  3 = weighted 2-tap
 //                  4 = 3rd-order extrapolation
+//                  5 = 2-sample average
+//                  6 = 3-sample average
+//                  7 = gentle 2-tap slope extrapolation
+//                  8 = strong 2-tap slope extrapolation
+//                  9 = damped 3-tap extrapolation
+//                 10 = curvature-smoothed 3-tap extrapolation
 //              - low  nibble = reserved and written as 0
 //     u16     residualPeakQ[channels]
 //              - block-local peak residual scale per channel, mapped to [0, 8]

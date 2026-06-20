@@ -23,6 +23,8 @@ constexpr float kMuLaw = 127.0f;
 constexpr float kSampleClamp = 1.0f;
 constexpr float kSilentPeakEpsilon = 1e-12f;
 constexpr uint8_t kMinQuantBits = 2;
+constexpr uint8_t kMaxPredictor = 10;
+constexpr size_t kPredictorCount = static_cast<size_t>(kMaxPredictor) + 1u;
 
 struct PlannedBlock
 {
@@ -116,6 +118,18 @@ float predictSample(uint8_t predictor, float prev1, float prev2, float prev3)
         return std::clamp(1.5f * prev1 - 0.5f * prev2, -kResidualPeakRange, kResidualPeakRange);
     case 4:
         return std::clamp(3.0f * prev1 - 3.0f * prev2 + prev3, -kResidualPeakRange, kResidualPeakRange);
+    case 5:
+        return std::clamp(0.5f * prev1 + 0.5f * prev2, -kResidualPeakRange, kResidualPeakRange);
+    case 6:
+        return std::clamp((prev1 + prev2 + prev3) * (1.0f / 3.0f), -kResidualPeakRange, kResidualPeakRange);
+    case 7:
+        return std::clamp(1.25f * prev1 - 0.25f * prev2, -kResidualPeakRange, kResidualPeakRange);
+    case 8:
+        return std::clamp(1.75f * prev1 - 0.75f * prev2, -kResidualPeakRange, kResidualPeakRange);
+    case 9:
+        return std::clamp(2.5f * prev1 - 2.0f * prev2 + 0.5f * prev3, -kResidualPeakRange, kResidualPeakRange);
+    case 10:
+        return std::clamp(1.75f * prev1 - prev2 + 0.25f * prev3, -kResidualPeakRange, kResidualPeakRange);
     default:
         return 0.0f;
     }
@@ -309,8 +323,20 @@ inline float predictSampleFast(float prev1, float prev2, float prev3)
         return clampPredictFast(2.0f * prev1 - prev2);
     else if constexpr (Predictor == 3)
         return clampPredictFast(1.5f * prev1 - 0.5f * prev2);
-    else
+    else if constexpr (Predictor == 4)
         return clampPredictFast(3.0f * prev1 - 3.0f * prev2 + prev3);
+    else if constexpr (Predictor == 5)
+        return clampPredictFast(0.5f * prev1 + 0.5f * prev2);
+    else if constexpr (Predictor == 6)
+        return clampPredictFast((prev1 + prev2 + prev3) * (1.0f / 3.0f));
+    else if constexpr (Predictor == 7)
+        return clampPredictFast(1.25f * prev1 - 0.25f * prev2);
+    else if constexpr (Predictor == 8)
+        return clampPredictFast(1.75f * prev1 - 0.75f * prev2);
+    else if constexpr (Predictor == 9)
+        return clampPredictFast(2.5f * prev1 - 2.0f * prev2 + 0.5f * prev3);
+    else
+        return clampPredictFast(1.75f * prev1 - prev2 + 0.25f * prev3);
 }
 
 template <uint8_t Predictor>
@@ -577,8 +603,26 @@ void evaluateBlockCandidateByPredictor(uint8_t predictor,
     case 3:
         output = evaluateBlockCandidate<3>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
         break;
-    default:
+    case 4:
         output = evaluateBlockCandidate<4>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        break;
+    case 5:
+        output = evaluateBlockCandidate<5>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        break;
+    case 6:
+        output = evaluateBlockCandidate<6>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        break;
+    case 7:
+        output = evaluateBlockCandidate<7>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        break;
+    case 8:
+        output = evaluateBlockCandidate<8>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        break;
+    case 9:
+        output = evaluateBlockCandidate<9>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        break;
+    default:
+        output = evaluateBlockCandidate<10>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
         break;
     }
 }
@@ -623,7 +667,7 @@ public:
 
         if (workerCount_ == 0)
         {
-            for (uint8_t predictor = 0; predictor <= 4; ++predictor)
+            for (uint8_t predictor = 0; predictor <= kMaxPredictor; ++predictor)
                 evaluateOne(predictor);
         }
         else
@@ -635,7 +679,7 @@ public:
         }
 
         BlockCandidate best = candidates_[0];
-        for (uint8_t predictor = 1; predictor <= 4; ++predictor)
+        for (uint8_t predictor = 1; predictor <= kMaxPredictor; ++predictor)
         {
             if (candidates_[predictor].distortion < best.distortion)
                 best = candidates_[predictor];
@@ -662,7 +706,7 @@ private:
         for (;;)
         {
             const unsigned predictor = nextPredictor_.fetch_add(1u, std::memory_order_relaxed);
-            if (predictor > 4u)
+            if (predictor > kMaxPredictor)
                 return;
             evaluateOne(static_cast<uint8_t>(predictor));
         }
@@ -695,7 +739,7 @@ private:
     const std::vector<float>* startPrev1_ = nullptr;
     const std::vector<float>* startPrev2_ = nullptr;
     const std::vector<float>* startPrev3_ = nullptr;
-    std::array<BlockCandidate, 5> candidates_{};
+    std::array<BlockCandidate, kPredictorCount> candidates_{};
 };
 
 void encodeBlockPayload(const audioStream& audio,
@@ -961,7 +1005,7 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
         const uint8_t predictor = static_cast<uint8_t>(packInfo >> 4);
         const uint8_t blockQuantBits = hdr.quantBits;
 
-        if (predictor > 4)
+        if (predictor > kMaxPredictor)
         {
             printf("Error! Invalid predictor type (%u).\n", predictor);
             return 1;
@@ -1017,6 +1061,24 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
             break;
         case 4:
             decodeOk = decodeBlockSamples<4>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            break;
+        case 5:
+            decodeOk = decodeBlockSamples<5>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            break;
+        case 6:
+            decodeOk = decodeBlockSamples<6>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            break;
+        case 7:
+            decodeOk = decodeBlockSamples<7>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            break;
+        case 8:
+            decodeOk = decodeBlockSamples<8>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            break;
+        case 9:
+            decodeOk = decodeBlockSamples<9>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            break;
+        case 10:
+            decodeOk = decodeBlockSamples<10>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
             break;
         default:
             decodeOk = false;
