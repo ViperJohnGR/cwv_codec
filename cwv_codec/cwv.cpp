@@ -23,8 +23,13 @@ constexpr float kMuLaw = 127.0f;
 constexpr float kSampleClamp = 1.0f;
 constexpr float kSilentPeakEpsilon = 1e-12f;
 constexpr uint8_t kMinQuantBits = 2;
-constexpr uint8_t kMaxPredictor = 10;
-constexpr size_t kPredictorCount = static_cast<size_t>(kMaxPredictor) + 1u;
+constexpr uint8_t kPredictorCount = 10;
+constexpr uint8_t kMaxPredictor = kPredictorCount - 1u;
+constexpr uint8_t kQuantizerModeCount = 4;
+constexpr uint8_t kMaxQuantizerMode = kQuantizerModeCount - 1u;
+constexpr uint8_t kMaxStoredQuantizerMode = kQuantizerModeCount;
+constexpr uint8_t kAnalysisJobCount = kPredictorCount * kQuantizerModeCount;
+
 
 struct PlannedBlock
 {
@@ -35,6 +40,7 @@ struct PlannedBlock
 struct BlockCandidate
 {
     uint8_t predictor = 0;
+    uint8_t quantizerMode = 0;
     uint8_t quantBits = 0;
     std::vector<uint16_t> peakQ;
     double distortion = 0.0;
@@ -104,32 +110,40 @@ struct PackedBitReader
     }
 };
 
+float clampPredict(float sample)
+{
+    return std::clamp(sample, -kSampleClamp, kSampleClamp);
+}
+
 float predictSample(uint8_t predictor, float prev1, float prev2, float prev3)
 {
     switch (predictor)
     {
-    case 0:
+    case 0: // no prediction
         return 0.0f;
-    case 1:
+    case 1: // previous sample
         return prev1;
-    case 2:
-        return std::clamp(2.0f * prev1 - prev2, -kResidualPeakRange, kResidualPeakRange);
-    case 3:
-        return std::clamp(1.5f * prev1 - 0.5f * prev2, -kResidualPeakRange, kResidualPeakRange);
-    case 4:
-        return std::clamp(3.0f * prev1 - 3.0f * prev2 + prev3, -kResidualPeakRange, kResidualPeakRange);
-    case 5:
-        return std::clamp(0.5f * prev1 + 0.5f * prev2, -kResidualPeakRange, kResidualPeakRange);
-    case 6:
-        return std::clamp((prev1 + prev2 + prev3) * (1.0f / 3.0f), -kResidualPeakRange, kResidualPeakRange);
-    case 7:
-        return std::clamp(1.25f * prev1 - 0.25f * prev2, -kResidualPeakRange, kResidualPeakRange);
-    case 8:
-        return std::clamp(1.75f * prev1 - 0.75f * prev2, -kResidualPeakRange, kResidualPeakRange);
-    case 9:
-        return std::clamp(2.5f * prev1 - 2.0f * prev2 + 0.5f * prev3, -kResidualPeakRange, kResidualPeakRange);
-    case 10:
-        return std::clamp(1.75f * prev1 - prev2 + 0.25f * prev3, -kResidualPeakRange, kResidualPeakRange);
+    case 2: // full 2nd-order extrapolation
+        return clampPredict(2.0f * prev1 - prev2);
+    case 3: // weighted 2-tap extrapolation
+        return clampPredict(1.5f * prev1 - 0.5f * prev2);
+    case 4: // 3rd-order extrapolation
+        return clampPredict(3.0f * prev1 - 3.0f * prev2 + prev3);
+    case 5: // damped slope
+        return clampPredict(prev1 + 0.25f * (prev1 - prev2));
+    case 6: // stronger damped slope
+        return clampPredict(prev1 + 0.75f * (prev1 - prev2));
+    case 7: // smoothed previous samples
+        return clampPredict(0.75f * prev1 + 0.25f * prev2);
+    case 8: // leaky previous sample
+        return clampPredict(0.9375f * prev1);
+    case 9: // slope-limited extrapolation
+    {
+        const float slope = prev1 - prev2;
+        const float prevSlope = prev2 - prev3;
+        const float limit = std::max(0.03125f, 1.5f * std::fabs(prevSlope));
+        return clampPredict(prev1 + std::clamp(slope, -limit, limit));
+    }
     default:
         return 0.0f;
     }
@@ -159,25 +173,51 @@ float dequantizeResidualPeak(uint16_t peakQ)
     return std::exp(logMin + normalized * logRange);
 }
 
-float compandMuLaw(float x)
+float quantizerMu(uint8_t quantizerMode)
+{
+    switch (quantizerMode)
+    {
+    case 1:
+        return 15.0f;
+    case 2:
+        return 255.0f;
+    default:
+        return kMuLaw;
+    }
+}
+
+bool quantizerIsLinear(uint8_t quantizerMode)
+{
+    return quantizerMode == 3u;
+}
+
+float compandResidual(float x, uint8_t quantizerMode)
 {
     x = std::clamp(x, -1.0f, 1.0f);
+    if (quantizerIsLinear(quantizerMode))
+        return x;
+
     const float ax = std::fabs(x);
     if (ax <= 0.0f)
         return 0.0f;
 
-    const float denom = std::log1p(kMuLaw);
-    return std::copysign(std::log1p(kMuLaw * ax) / denom, x);
+    const float mu = quantizerMu(quantizerMode);
+    const float denom = std::log1p(mu);
+    return std::copysign(std::log1p(mu * ax) / denom, x);
 }
 
-float expandMuLaw(float y)
+float expandResidual(float y, uint8_t quantizerMode)
 {
     y = std::clamp(y, -1.0f, 1.0f);
+    if (quantizerIsLinear(quantizerMode))
+        return y;
+
     const float ay = std::fabs(y);
     if (ay <= 0.0f)
         return 0.0f;
 
-    const float x = (std::pow(1.0f + kMuLaw, ay) - 1.0f) / kMuLaw;
+    const float mu = quantizerMu(quantizerMode);
+    const float x = (std::pow(1.0f + mu, ay) - 1.0f) / mu;
     return std::copysign(x, y);
 }
 
@@ -194,43 +234,46 @@ int32_t decodeSignedResidualCode(uint8_t code, uint8_t quantBits)
     return std::clamp(quantized, -maxMagnitude, maxMagnitude);
 }
 
-int32_t quantizeResidualMagnitudeReference(float normalizedMagnitude, uint32_t maxMagnitude)
+int32_t quantizeResidualMagnitudeReference(float normalizedMagnitude, uint32_t maxMagnitude, uint8_t quantizerMode)
 {
-    const float companded = compandMuLaw(normalizedMagnitude);
+    const float companded = compandResidual(normalizedMagnitude, quantizerMode);
     return std::clamp(
         static_cast<int32_t>(std::lround(companded * static_cast<float>(maxMagnitude))),
         0,
         static_cast<int32_t>(maxMagnitude));
 }
 
-const std::array<std::array<float, 127>, 9>& getResidualEncodeThresholds()
+const std::array<std::array<std::array<float, 127>, 9>, kQuantizerModeCount>& getResidualEncodeThresholds()
 {
     // The encoder is monotonic for |residual / peak| in [0, 1]. Find the exact
-    // float at which each magnitude code begins, once, then use comparisons in
-    // the hot loop. Searching float bit patterns preserves the old quantizer's
-    // mapping (including its float rounding) without a log1p() per sample.
-    static const std::array<std::array<float, 127>, 9> thresholds = []
+    // float at which each magnitude code begins for each quantizer mode, once,
+    // then use comparisons in the hot loop. Searching float bit patterns
+    // preserves the quantizer mapping without log1p() per sample.
+    static const std::array<std::array<std::array<float, 127>, 9>, kQuantizerModeCount> thresholds = []
     {
-        std::array<std::array<float, 127>, 9> table{};
+        std::array<std::array<std::array<float, 127>, 9>, kQuantizerModeCount> table{};
         constexpr uint32_t oneBits = std::bit_cast<uint32_t>(1.0f);
 
-        for (uint8_t quantBits = kMinQuantBits; quantBits <= 8; ++quantBits)
+        for (uint8_t quantizerMode = 0; quantizerMode < kQuantizerModeCount; ++quantizerMode)
         {
-            const uint32_t maxMagnitude = (1u << (quantBits - 1u)) - 1u;
-            for (uint32_t q = 1; q <= maxMagnitude; ++q)
+            for (uint8_t quantBits = kMinQuantBits; quantBits <= 8; ++quantBits)
             {
-                uint32_t low = 0u;
-                uint32_t high = oneBits;
-                while (low < high)
+                const uint32_t maxMagnitude = (1u << (quantBits - 1u)) - 1u;
+                for (uint32_t q = 1; q <= maxMagnitude; ++q)
                 {
-                    const uint32_t mid = low + ((high - low) >> 1u);
-                    const float x = std::bit_cast<float>(mid);
-                    if (quantizeResidualMagnitudeReference(x, maxMagnitude) >= static_cast<int32_t>(q))
-                        high = mid;
-                    else
-                        low = mid + 1u;
+                    uint32_t low = 0u;
+                    uint32_t high = oneBits;
+                    while (low < high)
+                    {
+                        const uint32_t mid = low + ((high - low) >> 1u);
+                        const float x = std::bit_cast<float>(mid);
+                        if (quantizeResidualMagnitudeReference(x, maxMagnitude, quantizerMode) >= static_cast<int32_t>(q))
+                            high = mid;
+                        else
+                            low = mid + 1u;
+                    }
+                    table[quantizerMode][quantBits][q - 1u] = std::bit_cast<float>(low);
                 }
-                table[quantBits][q - 1u] = std::bit_cast<float>(low);
             }
         }
         return table;
@@ -258,9 +301,9 @@ inline uint8_t encodeResidualCodeFast(float residual,
     return static_cast<uint8_t>((1u << quantBits) - magnitude);
 }
 
-uint8_t encodeResidualCode(float residual, uint8_t quantBits, float residualPeak)
+uint8_t encodeResidualCode(float residual, uint8_t quantBits, uint8_t quantizerMode, float residualPeak)
 {
-    if (quantBits < kMinQuantBits || quantBits > 8)
+    if (quantBits < kMinQuantBits || quantBits > 8 || quantizerMode >= kQuantizerModeCount)
         return 0;
 
     const uint32_t maxMagnitude = (1u << (quantBits - 1u)) - 1u;
@@ -268,24 +311,28 @@ uint8_t encodeResidualCode(float residual, uint8_t quantBits, float residualPeak
         residual,
         residualPeak,
         quantBits,
-        getResidualEncodeThresholds()[quantBits].data(),
+        getResidualEncodeThresholds()[quantizerMode][quantBits].data(),
         maxMagnitude);
 }
 
-const std::array<std::array<float, 256>, 9>& getResidualDecodeLut()
+const std::array<std::array<std::array<float, 256>, 9>, kQuantizerModeCount>& getResidualDecodeLut()
 {
-    static const std::array<std::array<float, 256>, 9> lut = []
+    static const std::array<std::array<std::array<float, 256>, 9>, kQuantizerModeCount> lut = []
     {
-        std::array<std::array<float, 256>, 9> table{};
-        for (uint8_t quantBits = kMinQuantBits; quantBits <= 8; ++quantBits)
+        std::array<std::array<std::array<float, 256>, 9>, kQuantizerModeCount> table{};
+        for (uint8_t quantizerMode = 0; quantizerMode < kQuantizerModeCount; ++quantizerMode)
         {
-            const uint32_t maxCode = (1u << quantBits) - 1u;
-            const int32_t maxMagnitude = static_cast<int32_t>((1u << (quantBits - 1u)) - 1u);
-            for (uint32_t code = 0; code <= maxCode; ++code)
+            for (uint8_t quantBits = kMinQuantBits; quantBits <= 8; ++quantBits)
             {
-                const int32_t quantized = decodeSignedResidualCode(static_cast<uint8_t>(code), quantBits);
-                table[quantBits][code] = expandMuLaw(
-                    static_cast<float>(quantized) / static_cast<float>(maxMagnitude));
+                const uint32_t maxCode = (1u << quantBits) - 1u;
+                const int32_t maxMagnitude = static_cast<int32_t>((1u << (quantBits - 1u)) - 1u);
+                for (uint32_t code = 0; code <= maxCode; ++code)
+                {
+                    const int32_t quantized = decodeSignedResidualCode(static_cast<uint8_t>(code), quantBits);
+                    table[quantizerMode][quantBits][code] = expandResidual(
+                        static_cast<float>(quantized) / static_cast<float>(maxMagnitude),
+                        quantizerMode);
+                }
             }
         }
         return table;
@@ -305,6 +352,15 @@ inline float clampSampleFast(float sample)
 
 inline float clampPredictFast(float sample)
 {
+    if (sample < -kSampleClamp)
+        return -kSampleClamp;
+    if (sample > kSampleClamp)
+        return kSampleClamp;
+    return sample;
+}
+
+inline float clampLegacyPredictFast(float sample)
+{
     if (sample < -kResidualPeakRange)
         return -kResidualPeakRange;
     if (sample > kResidualPeakRange)
@@ -312,7 +368,16 @@ inline float clampPredictFast(float sample)
     return sample;
 }
 
-template <uint8_t Predictor>
+template <bool LegacyPredictClamp>
+inline float clampPredictForMode(float sample)
+{
+    if constexpr (LegacyPredictClamp)
+        return clampLegacyPredictFast(sample);
+    else
+        return clampPredictFast(sample);
+}
+
+template <uint8_t Predictor, bool LegacyPredictClamp = false>
 inline float predictSampleFast(float prev1, float prev2, float prev3)
 {
     if constexpr (Predictor == 0)
@@ -320,28 +385,32 @@ inline float predictSampleFast(float prev1, float prev2, float prev3)
     else if constexpr (Predictor == 1)
         return prev1;
     else if constexpr (Predictor == 2)
-        return clampPredictFast(2.0f * prev1 - prev2);
+        return clampPredictForMode<LegacyPredictClamp>(2.0f * prev1 - prev2);
     else if constexpr (Predictor == 3)
-        return clampPredictFast(1.5f * prev1 - 0.5f * prev2);
+        return clampPredictForMode<LegacyPredictClamp>(1.5f * prev1 - 0.5f * prev2);
     else if constexpr (Predictor == 4)
-        return clampPredictFast(3.0f * prev1 - 3.0f * prev2 + prev3);
+        return clampPredictForMode<LegacyPredictClamp>(3.0f * prev1 - 3.0f * prev2 + prev3);
     else if constexpr (Predictor == 5)
-        return clampPredictFast(0.5f * prev1 + 0.5f * prev2);
+        return clampPredictFast(prev1 + 0.25f * (prev1 - prev2));
     else if constexpr (Predictor == 6)
-        return clampPredictFast((prev1 + prev2 + prev3) * (1.0f / 3.0f));
+        return clampPredictFast(prev1 + 0.75f * (prev1 - prev2));
     else if constexpr (Predictor == 7)
-        return clampPredictFast(1.25f * prev1 - 0.25f * prev2);
+        return clampPredictFast(0.75f * prev1 + 0.25f * prev2);
     else if constexpr (Predictor == 8)
-        return clampPredictFast(1.75f * prev1 - 0.75f * prev2);
-    else if constexpr (Predictor == 9)
-        return clampPredictFast(2.5f * prev1 - 2.0f * prev2 + 0.5f * prev3);
+        return clampPredictFast(0.9375f * prev1);
     else
-        return clampPredictFast(1.75f * prev1 - prev2 + 0.25f * prev3);
+    {
+        const float slope = prev1 - prev2;
+        const float prevSlope = prev2 - prev3;
+        const float limit = std::max(0.03125f, 1.5f * std::fabs(prevSlope));
+        return clampPredictFast(prev1 + std::clamp(slope, -limit, limit));
+    }
 }
 
-template <uint8_t Predictor>
+template <uint8_t Predictor, bool LegacyPredictClamp = false>
 bool decodeBlockSamples(PackedBitReader& payloadReader,
     uint8_t blockQuantBits,
+    uint8_t quantizerMode,
     const float* residualPeak,
     uint8_t channels,
     uint32_t framesInBlock,
@@ -350,7 +419,7 @@ bool decodeBlockSamples(PackedBitReader& payloadReader,
     float* prev3,
     float* output)
 {
-    const float* residualDecodeLut = getResidualDecodeLut()[blockQuantBits].data();
+    const float* residualDecodeLut = getResidualDecodeLut()[quantizerMode][blockQuantBits].data();
     size_t outIndex = 0;
 
     for (uint32_t f = 0; f < framesInBlock; ++f)
@@ -361,7 +430,7 @@ bool decodeBlockSamples(PackedBitReader& payloadReader,
             if (!payloadReader.read(blockQuantBits, code))
                 return false;
 
-            const float pred = predictSampleFast<Predictor>(prev1[ch], prev2[ch], prev3[ch]);
+            const float pred = predictSampleFast<Predictor, LegacyPredictClamp>(prev1[ch], prev2[ch], prev3[ch]);
             const float sample = clampSampleFast(pred + residualDecodeLut[code] * residualPeak[ch]);
             output[outIndex++] = sample;
             prev3[ch] = prev2[ch];
@@ -371,6 +440,47 @@ bool decodeBlockSamples(PackedBitReader& payloadReader,
     }
 
     return true;
+}
+
+template <uint8_t Predictor>
+bool decodeBlockSamplesWithClampMode(PackedBitReader& payloadReader,
+    uint8_t blockQuantBits,
+    uint8_t quantizerMode,
+    bool legacyPredictorClamp,
+    const float* residualPeak,
+    uint8_t channels,
+    uint32_t framesInBlock,
+    float* prev1,
+    float* prev2,
+    float* prev3,
+    float* output)
+{
+    if (legacyPredictorClamp)
+    {
+        return decodeBlockSamples<Predictor, true>(
+            payloadReader,
+            blockQuantBits,
+            quantizerMode,
+            residualPeak,
+            channels,
+            framesInBlock,
+            prev1,
+            prev2,
+            prev3,
+            output);
+    }
+
+    return decodeBlockSamples<Predictor, false>(
+        payloadReader,
+        blockQuantBits,
+        quantizerMode,
+        residualPeak,
+        channels,
+        framesInBlock,
+        prev1,
+        prev2,
+        prev3,
+        output);
 }
 
 std::vector<PlannedBlock> buildFixedBlockPlan(uint64_t totalFrames, uint32_t blockSizeFrames)
@@ -408,6 +518,7 @@ ChannelScaleResult evaluateChannelScale(const audioStream& audio,
     uint32_t framesInBlock,
     uint8_t channel,
     uint8_t quantBits,
+    uint8_t quantizerMode,
     float residualPeak,
     float startPrev1,
     float startPrev2,
@@ -423,8 +534,8 @@ ChannelScaleResult evaluateChannelScale(const audioStream& audio,
         + static_cast<size_t>(startFrame) * audio.channels
         + channel;
     const size_t stride = audio.channels;
-    const float* residualDecodeLut = getResidualDecodeLut()[quantBits].data();
-    const float* encodeThresholds = getResidualEncodeThresholds()[quantBits].data();
+    const float* residualDecodeLut = getResidualDecodeLut()[quantizerMode][quantBits].data();
+    const float* encodeThresholds = getResidualEncodeThresholds()[quantizerMode][quantBits].data();
     const uint32_t maxMagnitude = (1u << (quantBits - 1u)) - 1u;
 
     for (uint32_t f = 0; f < framesInBlock; ++f, input += stride)
@@ -476,12 +587,14 @@ BlockCandidate evaluateBlockCandidate(const audioStream& audio,
     uint32_t startFrame,
     uint32_t framesInBlock,
     uint8_t quantBits,
+    uint8_t quantizerMode,
     const std::vector<float>& startPrev1,
     const std::vector<float>& startPrev2,
     const std::vector<float>& startPrev3)
 {
     BlockCandidate candidate{};
     candidate.predictor = Predictor;
+    candidate.quantizerMode = quantizerMode;
     candidate.quantBits = quantBits;
     candidate.peakQ.assign(audio.channels, 0u);
     candidate.endPrev1 = startPrev1;
@@ -546,6 +659,7 @@ BlockCandidate evaluateBlockCandidate(const audioStream& audio,
                     framesInBlock,
                     ch,
                     quantBits,
+                    quantizerMode,
                     decodedPeak,
                     startPrev1[ch],
                     startPrev2[ch],
@@ -584,6 +698,7 @@ void evaluateBlockCandidateByPredictor(uint8_t predictor,
     uint32_t startFrame,
     uint32_t framesInBlock,
     uint8_t quantBits,
+    uint8_t quantizerMode,
     const std::vector<float>& startPrev1,
     const std::vector<float>& startPrev2,
     const std::vector<float>& startPrev3,
@@ -592,37 +707,34 @@ void evaluateBlockCandidateByPredictor(uint8_t predictor,
     switch (predictor)
     {
     case 0:
-        output = evaluateBlockCandidate<0>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        output = evaluateBlockCandidate<0>(audio, startFrame, framesInBlock, quantBits, quantizerMode, startPrev1, startPrev2, startPrev3);
         break;
     case 1:
-        output = evaluateBlockCandidate<1>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        output = evaluateBlockCandidate<1>(audio, startFrame, framesInBlock, quantBits, quantizerMode, startPrev1, startPrev2, startPrev3);
         break;
     case 2:
-        output = evaluateBlockCandidate<2>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        output = evaluateBlockCandidate<2>(audio, startFrame, framesInBlock, quantBits, quantizerMode, startPrev1, startPrev2, startPrev3);
         break;
     case 3:
-        output = evaluateBlockCandidate<3>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        output = evaluateBlockCandidate<3>(audio, startFrame, framesInBlock, quantBits, quantizerMode, startPrev1, startPrev2, startPrev3);
         break;
     case 4:
-        output = evaluateBlockCandidate<4>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        output = evaluateBlockCandidate<4>(audio, startFrame, framesInBlock, quantBits, quantizerMode, startPrev1, startPrev2, startPrev3);
         break;
     case 5:
-        output = evaluateBlockCandidate<5>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        output = evaluateBlockCandidate<5>(audio, startFrame, framesInBlock, quantBits, quantizerMode, startPrev1, startPrev2, startPrev3);
         break;
     case 6:
-        output = evaluateBlockCandidate<6>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        output = evaluateBlockCandidate<6>(audio, startFrame, framesInBlock, quantBits, quantizerMode, startPrev1, startPrev2, startPrev3);
         break;
     case 7:
-        output = evaluateBlockCandidate<7>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        output = evaluateBlockCandidate<7>(audio, startFrame, framesInBlock, quantBits, quantizerMode, startPrev1, startPrev2, startPrev3);
         break;
     case 8:
-        output = evaluateBlockCandidate<8>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
-        break;
-    case 9:
-        output = evaluateBlockCandidate<9>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        output = evaluateBlockCandidate<8>(audio, startFrame, framesInBlock, quantBits, quantizerMode, startPrev1, startPrev2, startPrev3);
         break;
     default:
-        output = evaluateBlockCandidate<10>(audio, startFrame, framesInBlock, quantBits, startPrev1, startPrev2, startPrev3);
+        output = evaluateBlockCandidate<9>(audio, startFrame, framesInBlock, quantBits, quantizerMode, startPrev1, startPrev2, startPrev3);
         break;
     }
 }
@@ -667,22 +779,22 @@ public:
 
         if (workerCount_ == 0)
         {
-            for (uint8_t predictor = 0; predictor <= kMaxPredictor; ++predictor)
-                evaluateOne(predictor);
+            for (uint8_t job = 0; job < kAnalysisJobCount; ++job)
+                evaluateOne(job);
         }
         else
         {
-            nextPredictor_.store(0u, std::memory_order_relaxed);
+            nextJob_.store(0u, std::memory_order_relaxed);
             startBarrier_.arrive_and_wait();
             runAvailableJobs();
             finishBarrier_.arrive_and_wait();
         }
 
         BlockCandidate best = candidates_[0];
-        for (uint8_t predictor = 1; predictor <= kMaxPredictor; ++predictor)
+        for (uint8_t job = 1; job < kAnalysisJobCount; ++job)
         {
-            if (candidates_[predictor].distortion < best.distortion)
-                best = candidates_[predictor];
+            if (candidates_[job].distortion < best.distortion)
+                best = candidates_[job];
         }
         return best;
     }
@@ -705,25 +817,28 @@ private:
     {
         for (;;)
         {
-            const unsigned predictor = nextPredictor_.fetch_add(1u, std::memory_order_relaxed);
-            if (predictor > kMaxPredictor)
+            const unsigned job = nextJob_.fetch_add(1u, std::memory_order_relaxed);
+            if (job >= kAnalysisJobCount)
                 return;
-            evaluateOne(static_cast<uint8_t>(predictor));
+            evaluateOne(static_cast<uint8_t>(job));
         }
     }
 
-    void evaluateOne(uint8_t predictor)
+    void evaluateOne(uint8_t job)
     {
+        const uint8_t predictor = static_cast<uint8_t>(job / kQuantizerModeCount);
+        const uint8_t quantizerMode = static_cast<uint8_t>(job % kQuantizerModeCount);
         evaluateBlockCandidateByPredictor(
             predictor,
             audio_,
             startFrame_,
             framesInBlock_,
             quantBits_,
+            quantizerMode,
             *startPrev1_,
             *startPrev2_,
             *startPrev3_,
-            candidates_[predictor]);
+            candidates_[job]);
     }
 
     const audioStream& audio_;
@@ -732,14 +847,14 @@ private:
     std::barrier<> startBarrier_;
     std::barrier<> finishBarrier_;
     std::vector<std::thread> workers_;
-    std::atomic<unsigned> nextPredictor_{ 0u };
+    std::atomic<unsigned> nextJob_{ 0u };
     std::atomic<bool> stopping_{ false };
     uint32_t startFrame_ = 0;
     uint32_t framesInBlock_ = 0;
     const std::vector<float>* startPrev1_ = nullptr;
     const std::vector<float>* startPrev2_ = nullptr;
     const std::vector<float>* startPrev3_ = nullptr;
-    std::array<BlockCandidate, kPredictorCount> candidates_{};
+    std::array<BlockCandidate, kAnalysisJobCount> candidates_{};
 };
 
 void encodeBlockPayload(const audioStream& audio,
@@ -747,6 +862,7 @@ void encodeBlockPayload(const audioStream& audio,
     uint32_t framesInBlock,
     uint8_t quantBits,
     uint8_t predictor,
+    uint8_t quantizerMode,
     const std::vector<uint16_t>& peakQ,
     std::vector<float>& statePrev1,
     std::vector<float>& statePrev2,
@@ -762,7 +878,7 @@ void encodeBlockPayload(const audioStream& audio,
     std::vector<float> decodedPeak(audio.channels, 0.0f);
     for (uint8_t ch = 0; ch < audio.channels; ++ch)
         decodedPeak[ch] = dequantizeResidualPeak(peakQ[ch]);
-    const float* residualDecodeLut = getResidualDecodeLut()[quantBits].data();
+    const float* residualDecodeLut = getResidualDecodeLut()[quantizerMode][quantBits].data();
 
     for (uint32_t f = 0; f < framesInBlock; ++f)
     {
@@ -771,7 +887,7 @@ void encodeBlockPayload(const audioStream& audio,
         {
             const float inputSample = std::clamp(audio.sampleData[base + ch], -kSampleClamp, kSampleClamp);
             const float pred = predictSample(predictor, statePrev1[ch], statePrev2[ch], statePrev3[ch]);
-            const uint8_t code = encodeResidualCode(inputSample - pred, quantBits, decodedPeak[ch]);
+            const uint8_t code = encodeResidualCode(inputSample - pred, quantBits, quantizerMode, decodedPeak[ch]);
             const float reconResidual = residualDecodeLut[code] * decodedPeak[ch];
             const float outputSample = std::clamp(pred + reconResidual, -kSampleClamp, kSampleClamp);
 
@@ -902,7 +1018,8 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
         const uint32_t framesInBlock = plan[b].frames;
         const BlockCandidate& choice = selected[b];
 
-        const uint8_t packInfo = static_cast<uint8_t>((choice.predictor & 0x0Fu) << 4);
+        const uint8_t storedQuantizerMode = static_cast<uint8_t>((choice.quantizerMode + 1u) & 0x0Fu);
+        const uint8_t packInfo = static_cast<uint8_t>(((choice.predictor & 0x0Fu) << 4) | storedQuantizerMode);
         out.push_back(packInfo);
         for (uint8_t ch = 0; ch < channels; ++ch)
             appendLE(out, choice.peakQ[ch]);
@@ -912,6 +1029,7 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
             framesInBlock,
             choice.quantBits,
             choice.predictor,
+            choice.quantizerMode,
             choice.peakQ,
             runningPrev1,
             runningPrev2,
@@ -1003,11 +1121,19 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
         }
         const uint8_t packInfo = input[offset++];
         const uint8_t predictor = static_cast<uint8_t>(packInfo >> 4);
+        const uint8_t storedQuantizerMode = static_cast<uint8_t>(packInfo & 0x0Fu);
+        const bool legacyPredictorClamp = storedQuantizerMode == 0u;
+        const uint8_t quantizerMode = legacyPredictorClamp ? 0u : static_cast<uint8_t>(storedQuantizerMode - 1u);
         const uint8_t blockQuantBits = hdr.quantBits;
 
         if (predictor > kMaxPredictor)
         {
             printf("Error! Invalid predictor type (%u).\n", predictor);
+            return 1;
+        }
+        if (storedQuantizerMode > kMaxStoredQuantizerMode)
+        {
+            printf("Error! Invalid stored quantizer mode (%u).\n", storedQuantizerMode);
             return 1;
         }
         if (blockQuantBits < kMinQuantBits || blockQuantBits > 8)
@@ -1048,37 +1174,34 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
         switch (predictor)
         {
         case 0:
-            decodeOk = decodeBlockSamples<0>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<0>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
             break;
         case 1:
-            decodeOk = decodeBlockSamples<1>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<1>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
             break;
         case 2:
-            decodeOk = decodeBlockSamples<2>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<2>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
             break;
         case 3:
-            decodeOk = decodeBlockSamples<3>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<3>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
             break;
         case 4:
-            decodeOk = decodeBlockSamples<4>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<4>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
             break;
         case 5:
-            decodeOk = decodeBlockSamples<5>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<5>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
             break;
         case 6:
-            decodeOk = decodeBlockSamples<6>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<6>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
             break;
         case 7:
-            decodeOk = decodeBlockSamples<7>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<7>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
             break;
         case 8:
-            decodeOk = decodeBlockSamples<8>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<8>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
             break;
         case 9:
-            decodeOk = decodeBlockSamples<9>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
-            break;
-        case 10:
-            decodeOk = decodeBlockSamples<10>(payloadReader, blockQuantBits, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<9>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
             break;
         default:
             decodeOk = false;

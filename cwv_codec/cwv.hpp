@@ -16,30 +16,34 @@
 //     u32     blockSize      (fixed block size in PCM frames)
 //     u32     numberOfBlocks
 //     u8      quantBits
-//              - fixed quant bits for the whole file (1..8)
+//              - fixed quant bits for the whole file (2..8)
 //
 //   Then for each block:
 //     u8      packInfo
 //              - high nibble = predictor
 //                  0 = none
-//                  1 = 1st-order
+//                  1 = previous sample
 //                  2 = 2nd-order extrapolation
-//                  3 = weighted 2-tap
+//                  3 = weighted 2-tap extrapolation
 //                  4 = 3rd-order extrapolation
-//                  5 = 2-sample average
-//                  6 = 3-sample average
-//                  7 = gentle 2-tap slope extrapolation
-//                  8 = strong 2-tap slope extrapolation
-//                  9 = damped 3-tap extrapolation
-//                 10 = curvature-smoothed 3-tap extrapolation
-//              - low  nibble = reserved and written as 0
+//                  5 = damped slope, prev1 + 0.25 * (prev1 - prev2)
+//                  6 = damped slope, prev1 + 0.75 * (prev1 - prev2)
+//                  7 = smoothed, 0.75 * prev1 + 0.25 * prev2
+//                  8 = leaky previous sample, 0.9375 * prev1
+//                  9 = slope-limited extrapolation
+//              - low  nibble = stored residual quantizer mode
+//                  0 = legacy CWV block: legacy predictor clamp, mu-law mu = 127
+//                  1 = sample-clamped predictors, mu-law mu = 127
+//                  2 = sample-clamped predictors, weaker mu-law mu = 15
+//                  3 = sample-clamped predictors, stronger mu-law mu = 255
+//                  4 = sample-clamped predictors, linear residual quantizer
 //     u16     residualPeakQ[channels]
 //              - block-local peak residual scale per channel, mapped to [0, 8]
 //     ...     audioData
 //              - bit-packed interleaved residual codes for every sample in the block
 //
 // Notes:
-// - Stereo is coded as independent channels; no side/mid transform is used.
+// - All streams are coded per channel with the same tools; no stereo-only transform is used.
 // - Predictor state carries across block boundaries, which reduces block-edge
 //   discontinuities compared with restarting prediction every block.
 // - Residuals are encoded in the sample domain with companded quantization,
