@@ -39,13 +39,14 @@
 //                  4 = sample-clamped predictors, linear residual quantizer
 //     u16     residualPeakQ[channels]
 //              - block-local peak residual scale per channel, mapped to [0, 8]
+//     s16     seedSampleQ[min(3, framesInBlock)][channels]
+//              - first samples in the block, interleaved by frame then channel
 //     ...     audioData
-//              - bit-packed interleaved residual codes for every sample in the block
+//              - bit-packed interleaved residual codes for the remaining samples in the block
 //
 // Notes:
 // - All streams are coded per channel with the same tools; no stereo-only transform is used.
-// - Predictor state carries across block boundaries, which reduces block-edge
-//   discontinuities compared with restarting prediction every block.
+// - Each block carries its own predictor seed samples and can be decoded independently.
 // - Residuals are encoded in the sample domain with companded quantization,
 //   which preserves low-level detail better than uniform block-normalized PCM.
 

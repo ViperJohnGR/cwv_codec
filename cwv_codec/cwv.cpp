@@ -29,6 +29,7 @@ constexpr uint8_t kQuantizerModeCount = 4;
 constexpr uint8_t kMaxQuantizerMode = kQuantizerModeCount - 1u;
 constexpr uint8_t kMaxStoredQuantizerMode = kQuantizerModeCount;
 constexpr uint8_t kAnalysisJobCount = kPredictorCount * kQuantizerModeCount;
+constexpr uint32_t kSeedFramesPerBlock = 3;
 
 
 struct PlannedBlock
@@ -350,6 +351,68 @@ inline float clampSampleFast(float sample)
     return sample;
 }
 
+uint32_t seedFramesForBlock(uint32_t framesInBlock)
+{
+    return std::min<uint32_t>(kSeedFramesPerBlock, framesInBlock);
+}
+
+int16_t quantizeSeedSample(float sample)
+{
+    sample = clampSampleFast(sample);
+    const float scaled = sample < 0.0f ? sample * 32768.0f : sample * 32767.0f;
+    const int32_t quantized = static_cast<int32_t>(std::lround(scaled));
+    return static_cast<int16_t>(std::clamp<int32_t>(quantized, -32768, 32767));
+}
+
+float dequantizeSeedSample(int16_t sampleQ)
+{
+    if (sampleQ < 0)
+        return static_cast<float>(sampleQ) / 32768.0f;
+    return static_cast<float>(sampleQ) / 32767.0f;
+}
+
+void resetStateFromBlockSeeds(const audioStream& audio,
+    uint32_t startFrame,
+    uint32_t framesInBlock,
+    std::vector<float>& statePrev1,
+    std::vector<float>& statePrev2,
+    std::vector<float>& statePrev3)
+{
+    statePrev1.assign(audio.channels, 0.0f);
+    statePrev2.assign(audio.channels, 0.0f);
+    statePrev3.assign(audio.channels, 0.0f);
+
+    const uint32_t seedFrames = seedFramesForBlock(framesInBlock);
+    const uint64_t startSample = static_cast<uint64_t>(startFrame) * audio.channels;
+    for (uint32_t f = 0; f < seedFrames; ++f)
+    {
+        const uint64_t base = startSample + static_cast<uint64_t>(f) * audio.channels;
+        for (uint8_t ch = 0; ch < audio.channels; ++ch)
+        {
+            const int16_t sampleQ = quantizeSeedSample(audio.sampleData[base + ch]);
+            const float sample = dequantizeSeedSample(sampleQ);
+            statePrev3[ch] = statePrev2[ch];
+            statePrev2[ch] = statePrev1[ch];
+            statePrev1[ch] = sample;
+        }
+    }
+}
+
+void appendBlockSeeds(std::vector<uint8_t>& out,
+    const audioStream& audio,
+    uint32_t startFrame,
+    uint32_t framesInBlock)
+{
+    const uint32_t seedFrames = seedFramesForBlock(framesInBlock);
+    const uint64_t startSample = static_cast<uint64_t>(startFrame) * audio.channels;
+    for (uint32_t f = 0; f < seedFrames; ++f)
+    {
+        const uint64_t base = startSample + static_cast<uint64_t>(f) * audio.channels;
+        for (uint8_t ch = 0; ch < audio.channels; ++ch)
+            appendLE(out, quantizeSeedSample(audio.sampleData[base + ch]));
+    }
+}
+
 inline float clampPredictFast(float sample)
 {
     if (sample < -kSampleClamp)
@@ -516,6 +579,7 @@ template <uint8_t Predictor>
 ChannelScaleResult evaluateChannelScale(const audioStream& audio,
     uint32_t startFrame,
     uint32_t framesInBlock,
+    uint32_t firstFrameInBlock,
     uint8_t channel,
     uint8_t quantBits,
     uint8_t quantizerMode,
@@ -531,14 +595,14 @@ ChannelScaleResult evaluateChannelScale(const audioStream& audio,
     float prev2 = startPrev2;
     float prev3 = startPrev3;
     const float* input = audio.sampleData.data()
-        + static_cast<size_t>(startFrame) * audio.channels
+        + static_cast<size_t>(startFrame + firstFrameInBlock) * audio.channels
         + channel;
     const size_t stride = audio.channels;
     const float* residualDecodeLut = getResidualDecodeLut()[quantizerMode][quantBits].data();
     const float* encodeThresholds = getResidualEncodeThresholds()[quantizerMode][quantBits].data();
     const uint32_t maxMagnitude = (1u << (quantBits - 1u)) - 1u;
 
-    for (uint32_t f = 0; f < framesInBlock; ++f, input += stride)
+    for (uint32_t f = firstFrameInBlock; f < framesInBlock; ++f, input += stride)
     {
         const float inputSample = clampSampleFast(*input);
         const float pred = predictSampleFast<Predictor>(prev1, prev2, prev3);
@@ -605,12 +669,15 @@ BlockCandidate evaluateBlockCandidate(const audioStream& audio,
     std::vector<float> analysisPrev1 = startPrev1;
     std::vector<float> analysisPrev2 = startPrev2;
     std::vector<float> analysisPrev3 = startPrev3;
+    const uint32_t firstFrameInBlock = seedFramesForBlock(framesInBlock);
+    const uint32_t residualFrames = framesInBlock - firstFrameInBlock;
+
     std::vector<std::vector<float>> residualMagnitudes(audio.channels);
     for (auto& values : residualMagnitudes)
-        values.reserve(framesInBlock);
+        values.reserve(residualFrames);
 
     const uint64_t startSample = static_cast<uint64_t>(startFrame) * audio.channels;
-    for (uint32_t f = 0; f < framesInBlock; ++f)
+    for (uint32_t f = firstFrameInBlock; f < framesInBlock; ++f)
     {
         const uint64_t base = startSample + static_cast<uint64_t>(f) * audio.channels;
         for (uint8_t ch = 0; ch < audio.channels; ++ch)
@@ -657,6 +724,7 @@ BlockCandidate evaluateBlockCandidate(const audioStream& audio,
                     audio,
                     startFrame,
                     framesInBlock,
+                    firstFrameInBlock,
                     ch,
                     quantBits,
                     quantizerMode,
@@ -860,6 +928,7 @@ private:
 void encodeBlockPayload(const audioStream& audio,
     uint32_t startFrame,
     uint32_t framesInBlock,
+    uint32_t firstFrameInBlock,
     uint8_t quantBits,
     uint8_t predictor,
     uint8_t quantizerMode,
@@ -869,7 +938,8 @@ void encodeBlockPayload(const audioStream& audio,
     std::vector<float>& statePrev3,
     std::vector<uint8_t>& codes)
 {
-    const uint32_t samplesInBlock = framesInBlock * audio.channels;
+    const uint32_t residualFrames = framesInBlock - firstFrameInBlock;
+    const uint32_t samplesInBlock = residualFrames * audio.channels;
     const uint64_t startSample = static_cast<uint64_t>(startFrame) * audio.channels;
 
     codes.clear();
@@ -880,7 +950,7 @@ void encodeBlockPayload(const audioStream& audio,
         decodedPeak[ch] = dequantizeResidualPeak(peakQ[ch]);
     const float* residualDecodeLut = getResidualDecodeLut()[quantizerMode][quantBits].data();
 
-    for (uint32_t f = 0; f < framesInBlock; ++f)
+    for (uint32_t f = firstFrameInBlock; f < framesInBlock; ++f)
     {
         const uint64_t base = startSample + static_cast<uint64_t>(f) * audio.channels;
         for (uint8_t ch = 0; ch < audio.channels; ++ch)
@@ -962,6 +1032,8 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
         const uint32_t startFrame = plan[b].startFrame;
         const uint32_t framesInBlock = plan[b].frames;
 
+        resetStateFromBlockSeeds(audio, startFrame, framesInBlock, runningPrev1, runningPrev2, runningPrev3);
+
         BlockCandidate best = analysisPool.analyze(
             startFrame,
             framesInBlock,
@@ -970,9 +1042,6 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
             runningPrev3);
 
         selected[b] = best;
-        runningPrev1 = best.endPrev1;
-        runningPrev2 = best.endPrev2;
-        runningPrev3 = best.endPrev3;
     }
     printf("\n");
     const auto analysisEnd = std::chrono::steady_clock::now();
@@ -980,7 +1049,14 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
 
     uint64_t payloadBytes = 0;
     for (const PlannedBlock& block : plan)
-        payloadBytes += 1u + static_cast<uint64_t>(channels) * sizeof(uint16_t) + calculateBitPackedSize(static_cast<size_t>(block.frames) * channels, bitsPerSample);
+    {
+        const uint32_t seedFrames = seedFramesForBlock(block.frames);
+        const uint32_t residualFrames = block.frames - seedFrames;
+        payloadBytes += 1u
+            + static_cast<uint64_t>(channels) * sizeof(uint16_t)
+            + static_cast<uint64_t>(seedFrames) * channels * sizeof(int16_t)
+            + calculateBitPackedSize(static_cast<size_t>(residualFrames) * channels, bitsPerSample);
+    }
 
     std::vector<uint8_t> out;
     out.reserve(64 + static_cast<size_t>(payloadBytes));
@@ -1024,9 +1100,14 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
         for (uint8_t ch = 0; ch < channels; ++ch)
             appendLE(out, choice.peakQ[ch]);
 
+        appendBlockSeeds(out, audio, startFrame, framesInBlock);
+        const uint32_t firstFrameInBlock = seedFramesForBlock(framesInBlock);
+        resetStateFromBlockSeeds(audio, startFrame, framesInBlock, runningPrev1, runningPrev2, runningPrev3);
+
         encodeBlockPayload(audio,
             startFrame,
             framesInBlock,
+            firstFrameInBlock,
             choice.quantBits,
             choice.predictor,
             choice.quantizerMode,
@@ -1153,8 +1234,32 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
             residualPeak[ch] = dequantizeResidualPeak(peakQ);
         }
 
-        const uint32_t samplesInBlock = framesInBlock * hdr.channels;
-        const size_t payloadBytes = calculateBitPackedSize(samplesInBlock, blockQuantBits);
+        prev1.assign(hdr.channels, 0.0f);
+        prev2.assign(hdr.channels, 0.0f);
+        prev3.assign(hdr.channels, 0.0f);
+
+        const uint32_t firstFrameInBlock = seedFramesForBlock(framesInBlock);
+        float* const blockOutput = outputBuffer.data() + static_cast<size_t>(startSample);
+        for (uint32_t f = 0; f < firstFrameInBlock; ++f)
+        {
+            for (uint8_t ch = 0; ch < hdr.channels; ++ch)
+            {
+                int16_t sampleQ = 0;
+                if (!readLE(input, offset, sampleQ))
+                {
+                    printf("Error! Truncated CWV block seeds.\n");
+                    return 1;
+                }
+                const float sample = dequantizeSeedSample(sampleQ);
+                blockOutput[static_cast<size_t>(f) * hdr.channels + ch] = sample;
+                prev3[ch] = prev2[ch];
+                prev2[ch] = prev1[ch];
+                prev1[ch] = sample;
+            }
+        }
+
+        const uint32_t residualSamplesInBlock = (framesInBlock - firstFrameInBlock) * hdr.channels;
+        const size_t payloadBytes = calculateBitPackedSize(residualSamplesInBlock, blockQuantBits);
         if (offset + payloadBytes > input.size())
         {
             printf("Error! Truncated CWV block payload.\n");
@@ -1164,7 +1269,7 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
         PackedBitReader payloadReader{ input.data() + offset, payloadBytes };
         offset += payloadBytes;
 
-        float* const blockOutput = outputBuffer.data() + static_cast<size_t>(startSample);
+        float* const residualOutput = blockOutput + static_cast<size_t>(firstFrameInBlock) * hdr.channels;
         float* const prev1Data = prev1.data();
         float* const prev2Data = prev2.data();
         float* const prev3Data = prev3.data();
@@ -1174,34 +1279,34 @@ int decodeCWV(const std::vector<uint8_t>& input, std::vector<float>& outputBuffe
         switch (predictor)
         {
         case 0:
-            decodeOk = decodeBlockSamplesWithClampMode<0>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<0>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock - firstFrameInBlock, prev1Data, prev2Data, prev3Data, residualOutput);
             break;
         case 1:
-            decodeOk = decodeBlockSamplesWithClampMode<1>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<1>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock - firstFrameInBlock, prev1Data, prev2Data, prev3Data, residualOutput);
             break;
         case 2:
-            decodeOk = decodeBlockSamplesWithClampMode<2>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<2>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock - firstFrameInBlock, prev1Data, prev2Data, prev3Data, residualOutput);
             break;
         case 3:
-            decodeOk = decodeBlockSamplesWithClampMode<3>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<3>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock - firstFrameInBlock, prev1Data, prev2Data, prev3Data, residualOutput);
             break;
         case 4:
-            decodeOk = decodeBlockSamplesWithClampMode<4>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<4>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock - firstFrameInBlock, prev1Data, prev2Data, prev3Data, residualOutput);
             break;
         case 5:
-            decodeOk = decodeBlockSamplesWithClampMode<5>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<5>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock - firstFrameInBlock, prev1Data, prev2Data, prev3Data, residualOutput);
             break;
         case 6:
-            decodeOk = decodeBlockSamplesWithClampMode<6>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<6>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock - firstFrameInBlock, prev1Data, prev2Data, prev3Data, residualOutput);
             break;
         case 7:
-            decodeOk = decodeBlockSamplesWithClampMode<7>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<7>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock - firstFrameInBlock, prev1Data, prev2Data, prev3Data, residualOutput);
             break;
         case 8:
-            decodeOk = decodeBlockSamplesWithClampMode<8>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<8>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock - firstFrameInBlock, prev1Data, prev2Data, prev3Data, residualOutput);
             break;
         case 9:
-            decodeOk = decodeBlockSamplesWithClampMode<9>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock, prev1Data, prev2Data, prev3Data, blockOutput);
+            decodeOk = decodeBlockSamplesWithClampMode<9>(payloadReader, blockQuantBits, quantizerMode, legacyPredictorClamp, residualPeakData, hdr.channels, framesInBlock - firstFrameInBlock, prev1Data, prev2Data, prev3Data, residualOutput);
             break;
         default:
             decodeOk = false;
