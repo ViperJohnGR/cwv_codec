@@ -807,123 +807,146 @@ void evaluateBlockCandidateByPredictor(uint8_t predictor,
     }
 }
 
-class BlockAnalysisPool
+BlockCandidate analyzeBlockSerial(const audioStream& audio,
+    uint32_t startFrame,
+    uint32_t framesInBlock,
+    uint8_t quantBits)
 {
-public:
-    BlockAnalysisPool(const audioStream& audio, uint8_t quantBits, unsigned workerCount)
-        : audio_(audio),
-          quantBits_(quantBits),
-          workerCount_(workerCount),
-          startBarrier_(static_cast<std::ptrdiff_t>(workerCount + 1u)),
-          finishBarrier_(static_cast<std::ptrdiff_t>(workerCount + 1u))
-    {
-        workers_.reserve(workerCount_);
-        for (unsigned i = 0; i < workerCount_; ++i)
-            workers_.emplace_back([this] { workerMain(); });
-    }
+    std::vector<float> startPrev1(audio.channels, 0.0f);
+    std::vector<float> startPrev2(audio.channels, 0.0f);
+    std::vector<float> startPrev3(audio.channels, 0.0f);
+    resetStateFromBlockSeeds(audio, startFrame, framesInBlock, startPrev1, startPrev2, startPrev3);
 
-    ~BlockAnalysisPool()
-    {
-        if (workerCount_ == 0)
-            return;
-
-        stopping_.store(true, std::memory_order_relaxed);
-        startBarrier_.arrive_and_wait();
-        for (std::thread& worker : workers_)
-            worker.join();
-    }
-
-    BlockCandidate analyze(uint32_t startFrame,
-        uint32_t framesInBlock,
-        const std::vector<float>& startPrev1,
-        const std::vector<float>& startPrev2,
-        const std::vector<float>& startPrev3)
-    {
-        startFrame_ = startFrame;
-        framesInBlock_ = framesInBlock;
-        startPrev1_ = &startPrev1;
-        startPrev2_ = &startPrev2;
-        startPrev3_ = &startPrev3;
-
-        if (workerCount_ == 0)
-        {
-            for (uint8_t job = 0; job < kAnalysisJobCount; ++job)
-                evaluateOne(job);
-        }
-        else
-        {
-            nextJob_.store(0u, std::memory_order_relaxed);
-            startBarrier_.arrive_and_wait();
-            runAvailableJobs();
-            finishBarrier_.arrive_and_wait();
-        }
-
-        BlockCandidate best = candidates_[0];
-        for (uint8_t job = 1; job < kAnalysisJobCount; ++job)
-        {
-            if (candidates_[job].distortion < best.distortion)
-                best = candidates_[job];
-        }
-        return best;
-    }
-
-private:
-    void workerMain()
-    {
-        for (;;)
-        {
-            startBarrier_.arrive_and_wait();
-            if (stopping_.load(std::memory_order_relaxed))
-                return;
-
-            runAvailableJobs();
-            finishBarrier_.arrive_and_wait();
-        }
-    }
-
-    void runAvailableJobs()
-    {
-        for (;;)
-        {
-            const unsigned job = nextJob_.fetch_add(1u, std::memory_order_relaxed);
-            if (job >= kAnalysisJobCount)
-                return;
-            evaluateOne(static_cast<uint8_t>(job));
-        }
-    }
-
-    void evaluateOne(uint8_t job)
+    std::array<BlockCandidate, kAnalysisJobCount> candidates{};
+    for (uint8_t job = 0; job < kAnalysisJobCount; ++job)
     {
         const uint8_t predictor = static_cast<uint8_t>(job / kQuantizerModeCount);
         const uint8_t quantizerMode = static_cast<uint8_t>(job % kQuantizerModeCount);
         evaluateBlockCandidateByPredictor(
             predictor,
-            audio_,
-            startFrame_,
-            framesInBlock_,
-            quantBits_,
+            audio,
+            startFrame,
+            framesInBlock,
+            quantBits,
             quantizerMode,
-            *startPrev1_,
-            *startPrev2_,
-            *startPrev3_,
-            candidates_[job]);
+            startPrev1,
+            startPrev2,
+            startPrev3,
+            candidates[job]);
     }
 
-    const audioStream& audio_;
-    uint8_t quantBits_ = 0;
-    unsigned workerCount_ = 0;
-    std::barrier<> startBarrier_;
-    std::barrier<> finishBarrier_;
-    std::vector<std::thread> workers_;
-    std::atomic<unsigned> nextJob_{ 0u };
-    std::atomic<bool> stopping_{ false };
-    uint32_t startFrame_ = 0;
-    uint32_t framesInBlock_ = 0;
-    const std::vector<float>* startPrev1_ = nullptr;
-    const std::vector<float>* startPrev2_ = nullptr;
-    const std::vector<float>* startPrev3_ = nullptr;
-    std::array<BlockCandidate, kAnalysisJobCount> candidates_{};
+    BlockCandidate best = candidates[0];
+    for (uint8_t job = 1; job < kAnalysisJobCount; ++job)
+    {
+        if (candidates[job].distortion < best.distortion)
+            best = candidates[job];
+    }
+    return best;
+}
+
+unsigned encoderThreadCount(uint32_t numberOfBlocks)
+{
+    const unsigned hardwareThreads = std::thread::hardware_concurrency();
+    if (numberOfBlocks < 2u || hardwareThreads < 2u)
+        return 1u;
+    return std::max(1u, std::min<unsigned>(hardwareThreads, numberOfBlocks));
+}
+
+template <class Fn>
+void runBlockJobs(uint32_t numberOfBlocks, unsigned threadCount, Fn&& fn)
+{
+    if (threadCount <= 1u)
+    {
+        for (uint32_t b = 0; b < numberOfBlocks; ++b)
+            fn(b);
+        return;
+    }
+
+    std::atomic<uint32_t> nextBlock{ 0u };
+    std::vector<std::thread> workers;
+    workers.reserve(threadCount);
+    for (unsigned worker = 0; worker < threadCount; ++worker)
+    {
+        workers.emplace_back([&]
+        {
+            for (;;)
+            {
+                const uint32_t b = nextBlock.fetch_add(1u, std::memory_order_relaxed);
+                if (b >= numberOfBlocks)
+                    break;
+                fn(b);
+            }
+        });
+    }
+
+    for (std::thread& worker : workers)
+        worker.join();
+}
+
+struct EncodedBlock
+{
+    std::vector<uint8_t> bytes;
 };
+
+void encodeBlockPayload(const audioStream& audio,
+    uint32_t startFrame,
+    uint32_t framesInBlock,
+    uint32_t firstFrameInBlock,
+    uint8_t quantBits,
+    uint8_t predictor,
+    uint8_t quantizerMode,
+    const std::vector<uint16_t>& peakQ,
+    std::vector<float>& statePrev1,
+    std::vector<float>& statePrev2,
+    std::vector<float>& statePrev3,
+    std::vector<uint8_t>& codes);
+
+void encodeBlockBytes(const audioStream& audio,
+    const PlannedBlock& block,
+    const BlockCandidate& choice,
+    EncodedBlock& output)
+{
+    std::vector<float> statePrev1(audio.channels, 0.0f);
+    std::vector<float> statePrev2(audio.channels, 0.0f);
+    std::vector<float> statePrev3(audio.channels, 0.0f);
+    std::vector<uint8_t> codes;
+
+    const uint32_t seedFrames = seedFramesForBlock(block.frames);
+    const uint32_t residualFrames = block.frames - seedFrames;
+    const size_t payloadBytes = 1u
+        + static_cast<size_t>(audio.channels) * sizeof(uint16_t)
+        + static_cast<size_t>(seedFrames) * audio.channels * sizeof(int16_t)
+        + calculateBitPackedSize(static_cast<size_t>(residualFrames) * audio.channels, choice.quantBits);
+
+    std::vector<uint8_t> bytes;
+    bytes.reserve(payloadBytes);
+
+    const uint8_t storedQuantizerMode = static_cast<uint8_t>((choice.quantizerMode + 1u) & 0x0Fu);
+    const uint8_t packInfo = static_cast<uint8_t>(((choice.predictor & 0x0Fu) << 4) | storedQuantizerMode);
+    bytes.push_back(packInfo);
+    for (uint8_t ch = 0; ch < audio.channels; ++ch)
+        appendLE(bytes, choice.peakQ[ch]);
+
+    appendBlockSeeds(bytes, audio, block.startFrame, block.frames);
+    resetStateFromBlockSeeds(audio, block.startFrame, block.frames, statePrev1, statePrev2, statePrev3);
+
+    encodeBlockPayload(audio,
+        block.startFrame,
+        block.frames,
+        seedFrames,
+        choice.quantBits,
+        choice.predictor,
+        choice.quantizerMode,
+        choice.peakQ,
+        statePrev1,
+        statePrev2,
+        statePrev3,
+        codes);
+
+    const BitPack packed = packBitsFixed<uint8_t>(codes, choice.quantBits);
+    bytes.insert(bytes.end(), packed.bytes.begin(), packed.bytes.end());
+    output.bytes = std::move(bytes);
+}
 
 void encodeBlockPayload(const audioStream& audio,
     uint32_t startFrame,
@@ -1000,51 +1023,24 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
     }
 
     const uint32_t numberOfBlocks = static_cast<uint32_t>(plan.size());
+    const unsigned threadCount = encoderThreadCount(numberOfBlocks);
     printf("Using fixed-size block plan with %u blocks.\n", numberOfBlocks);
+    if (threadCount > 1u)
+        printf("Encoder threads: %u\n", threadCount);
+
     printf("Analyzing %u blocks...\n", numberOfBlocks);
     const auto analysisStart = std::chrono::steady_clock::now();
 
     std::vector<BlockCandidate> selected(numberOfBlocks);
-    std::vector<float> runningPrev1(channels, 0.0f);
-    std::vector<float> runningPrev2(channels, 0.0f);
-    std::vector<float> runningPrev3(channels, 0.0f);
-
-    const unsigned hardwareThreads = std::thread::hardware_concurrency();
-    const unsigned analysisWorkers = numberOfBlocks >= 64u && hardwareThreads > 1u
-        ? std::min(4u, hardwareThreads - 1u)
-        : 0u;
-    if (analysisWorkers > 0u)
-        printf("Analysis threads: %u\n", analysisWorkers + 1u);
-
-    BlockAnalysisPool analysisPool(audio, bitsPerSample, analysisWorkers);
-
-    unsigned lastPercent = 101;
-    for (uint32_t b = 0; b < numberOfBlocks; ++b)
+    std::atomic<uint32_t> analyzedBlocks{ 0u };
+    runBlockJobs(numberOfBlocks, threadCount, [&](uint32_t b)
     {
-        const unsigned percent = static_cast<unsigned>(((static_cast<uint64_t>(b) + 1u) * 100u) / numberOfBlocks);
-        if (percent != lastPercent)
-        {
-            printf("\rAnalysis progress: %3u%% (%u/%u)", percent, b + 1u, numberOfBlocks);
-            fflush(stdout);
-            lastPercent = percent;
-        }
+        selected[b] = analyzeBlockSerial(audio, plan[b].startFrame, plan[b].frames, bitsPerSample);
+        analyzedBlocks.fetch_add(1u, std::memory_order_relaxed);
+    });
 
-        const uint32_t startFrame = plan[b].startFrame;
-        const uint32_t framesInBlock = plan[b].frames;
-
-        resetStateFromBlockSeeds(audio, startFrame, framesInBlock, runningPrev1, runningPrev2, runningPrev3);
-
-        BlockCandidate best = analysisPool.analyze(
-            startFrame,
-            framesInBlock,
-            runningPrev1,
-            runningPrev2,
-            runningPrev3);
-
-        selected[b] = best;
-    }
-    printf("\n");
     const auto analysisEnd = std::chrono::steady_clock::now();
+    printf("Analysis done: %u/%u blocks\n", analyzedBlocks.load(std::memory_order_relaxed), numberOfBlocks);
     printf("Analysis time: %.3f s\n", std::chrono::duration<double>(analysisEnd - analysisStart).count());
 
     uint64_t payloadBytes = 0;
@@ -1058,6 +1054,20 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
             + calculateBitPackedSize(static_cast<size_t>(residualFrames) * channels, bitsPerSample);
     }
 
+    std::vector<EncodedBlock> encodedBlocks(numberOfBlocks);
+
+    printf("Encoding %u blocks...\n", numberOfBlocks);
+    const auto encodeStart = std::chrono::steady_clock::now();
+    std::atomic<uint32_t> encodedBlockCount{ 0u };
+    runBlockJobs(numberOfBlocks, threadCount, [&](uint32_t b)
+    {
+        encodeBlockBytes(audio, plan[b], selected[b], encodedBlocks[b]);
+        encodedBlockCount.fetch_add(1u, std::memory_order_relaxed);
+    });
+    const auto encodeEnd = std::chrono::steady_clock::now();
+    printf("Encoding done: %u/%u blocks\n", encodedBlockCount.load(std::memory_order_relaxed), numberOfBlocks);
+    printf("Payload encode time: %.3f s\n", std::chrono::duration<double>(encodeEnd - encodeStart).count());
+
     std::vector<uint8_t> out;
     out.reserve(64 + static_cast<size_t>(payloadBytes));
 
@@ -1067,66 +1077,12 @@ std::vector<uint8_t> encodeCWV(audioStream& audio, uint32_t blockSizeFrames, uin
     appendLE(out, static_cast<int64_t>(audio.totalPCMFrameCount));
     appendLE(out, static_cast<uint32_t>(blockSizeFrames));
     appendLE(out, static_cast<uint32_t>(numberOfBlocks));
-
     appendLE(out, bitsPerSample);
 
-    std::vector<uint8_t> codes;
-    runningPrev1.assign(channels, 0.0f);
-    runningPrev2.assign(channels, 0.0f);
-    runningPrev3.assign(channels, 0.0f);
+    for (const EncodedBlock& block : encodedBlocks)
+        out.insert(out.end(), block.bytes.begin(), block.bytes.end());
 
-    printf("Encoding %u blocks...\n", numberOfBlocks);
-    uint32_t lastEncodeProgressPercent = std::numeric_limits<uint32_t>::max();
-    auto printEncodeProgress = [&](uint32_t completedBlocks)
-    {
-        const uint32_t percent = (completedBlocks * 100u) / numberOfBlocks;
-        if (percent == lastEncodeProgressPercent)
-            return;
-        printf("\rEncoding progress: %3u%% (%u/%u blocks)", percent, completedBlocks, numberOfBlocks);
-        fflush(stdout);
-        lastEncodeProgressPercent = percent;
-    };
-
-    printEncodeProgress(0);
-    for (uint32_t b = 0; b < numberOfBlocks; ++b)
-    {
-        const uint32_t startFrame = plan[b].startFrame;
-        const uint32_t framesInBlock = plan[b].frames;
-        const BlockCandidate& choice = selected[b];
-
-        const uint8_t storedQuantizerMode = static_cast<uint8_t>((choice.quantizerMode + 1u) & 0x0Fu);
-        const uint8_t packInfo = static_cast<uint8_t>(((choice.predictor & 0x0Fu) << 4) | storedQuantizerMode);
-        out.push_back(packInfo);
-        for (uint8_t ch = 0; ch < channels; ++ch)
-            appendLE(out, choice.peakQ[ch]);
-
-        appendBlockSeeds(out, audio, startFrame, framesInBlock);
-        const uint32_t firstFrameInBlock = seedFramesForBlock(framesInBlock);
-        resetStateFromBlockSeeds(audio, startFrame, framesInBlock, runningPrev1, runningPrev2, runningPrev3);
-
-        encodeBlockPayload(audio,
-            startFrame,
-            framesInBlock,
-            firstFrameInBlock,
-            choice.quantBits,
-            choice.predictor,
-            choice.quantizerMode,
-            choice.peakQ,
-            runningPrev1,
-            runningPrev2,
-            runningPrev3,
-            codes);
-
-        const BitPack packed = packBitsFixed<uint8_t>(codes, choice.quantBits);
-        out.insert(out.end(), packed.bytes.begin(), packed.bytes.end());
-
-        printEncodeProgress(b + 1u);
-    }
-
-    if (numberOfBlocks > 0)
-        printf("\n");
-
-    printf("Encoding done. Output size: %s\n", printBytes(out.size()).c_str());
+    printf("Output size: %s\n", printBytes(out.size()).c_str());
     return out;
 }
 
